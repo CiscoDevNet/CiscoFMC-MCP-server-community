@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  mcp-sfw-fmc:
+    build: .
+    container_name: mcp-sfw-fmc
+    environment:
+      # ==== REQUIRED FOR FMC ====
+      FMC_BASE_URL: "https://10.127.245.140"   # change to your FMC
+      FMC_USERNAME: "adminapi"                 # change to your svc account
+      FMC_PASSWORD: "C1sco!@#$"                # change to your svc account
+
+      # ==== OPTIONAL FMC SETTINGS ====
+      FMC_VERIFY_SSL: "false"                  # "true" in prod with trusted certs
+      FMC_TIMEOUT: "30"
+      # FMC_DOMAIN_UUID: "e276abec-e0f2-11e3-8169-6d9ed49b625f"
+
+      LOG_LEVEL: "INFO"
+
+      # ==== MCP SERVER SETTINGS ====
+      MCP_TRANSPORT: "http"    # http for Docker, stdio for desktop MCP
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+
+    ports:
+      - "8000:8000"  # expose MCP HTTP endpoint
+
+    restart: unless-stopped
