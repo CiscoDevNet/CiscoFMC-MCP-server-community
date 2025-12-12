@@ -1,1358 +1,1259 @@
-#!/usr/bin/env python3
-"""
-Cisco Secure Firewall FMC MCP server
+from __future__ import annotations
 
-FastMCP-based MCP server that exposes tools to:
-- Find rules by IP/CIDR/FQDN within a specific Access Policy
-- Resolve an FTD/cluster target to its Access Policy and search rules
-- FMC-centric search across Access Policies (search_access_rules)
-
-Assumptions:
-- FastMCP 2.x-style usage with @mcp.tool() decorators.
-- No FastMCP constructor extras (description/version) – compatible
-  with the version installed in the container.
-"""
-
-import asyncio
 import ipaddress
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Literal
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import FastMCP  # FastMCP 2.x
 
-# -----------------------------------------------------------------------------
-# Logging setup
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Logging (STDERR only – safe for MCP servers)
+# --------------------------------------------------------------------------------------
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
-logger = logging.getLogger("fmc-mcp")
+logger = logging.getLogger("sfw-mcp-fmc")
 
-# -----------------------------------------------------------------------------
-# Environment / FMC config
-# -----------------------------------------------------------------------------
-FMC_BASE_URL = os.getenv("FMC_BASE_URL", "").rstrip("/")
-FMC_USERNAME = os.getenv("FMC_USERNAME")
-FMC_PASSWORD = os.getenv("FMC_PASSWORD")
-FMC_DOMAIN_UUID = os.getenv("FMC_DOMAIN_UUID")  # optional override
-FMC_VERIFY_SSL = os.getenv("FMC_VERIFY_SSL", "false").lower() == "true"
-FMC_TIMEOUT = float(os.getenv("FMC_TIMEOUT", "30"))
+# Reduce httpx noise unless explicitly overridden
+HTTPX_LOG_LEVEL = os.getenv("HTTPX_LOG_LEVEL", "INFO").upper()
+logging.getLogger("httpx").setLevel(HTTPX_LOG_LEVEL)
 
-if not FMC_BASE_URL or not FMC_USERNAME or not FMC_PASSWORD:
-    logger.warning(
-        "FMC_BASE_URL, FMC_USERNAME, or FMC_PASSWORD not fully set in environment. "
-        "Tools will fail if FMC access is required."
-    )
+# Limit paging for dynamic objects (these can be VERY heavy)
+_dynamic_pages_env = os.getenv("FMC_DYNAMICOBJECT_MAX_PAGES", "5")
+try:
+    DYNAMICOBJECT_HARD_PAGE_LIMIT = max(1, int(_dynamic_pages_env))
+except ValueError:
+    DYNAMICOBJECT_HARD_PAGE_LIMIT = 5
 
-# -----------------------------------------------------------------------------
-# HTTP / FMC client helpers
-# -----------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# Config & FMC client
+# --------------------------------------------------------------------------------------
+
+
 @dataclass
-class FMCAuthToken:
-    token: str
-    refresh_token: Optional[str]
-    domain_uuid: Optional[str]
+class FMCSettings:
+    """
+    Basic configuration for connecting to an FMC instance.
+
+    In future, we can support multiple FMCs by having several FMCSettings
+    instances loaded from a registry / config file, but for now we keep a
+    single-FMC view using environment variables.
+    """
+
+    base_url: str
+    username: str
+    password: str
+    verify_ssl: bool = False
+    timeout: float = 30.0
+    domain_uuid: Optional[str] = None
+
+    @classmethod
+    def from_env(cls) -> "FMCSettings":
+        """
+        Construct settings from environment variables.
+
+        Required:
+          - FMC_BASE_URL
+          - FMC_USERNAME
+          - FMC_PASSWORD
+
+        Optional:
+          - FMC_VERIFY_SSL (true/false/1/0/yes/no)
+          - FMC_TIMEOUT (seconds, float)
+          - FMC_DOMAIN_UUID
+        """
+        base_url = os.getenv("FMC_BASE_URL")
+        username = os.getenv("FMC_USERNAME")
+        password = os.getenv("FMC_PASSWORD")
+
+        if not base_url or not username or not password:
+            raise ValueError(
+                "FMC_BASE_URL, FMC_USERNAME, and FMC_PASSWORD must be set in environment"
+            )
+
+        verify_env = os.getenv("FMC_VERIFY_SSL", "false").strip().lower()
+        verify_ssl = verify_env in {"1", "true", "yes", "y"}
+
+        timeout_str = os.getenv("FMC_TIMEOUT", "30").strip()
+        try:
+            timeout = float(timeout_str)
+        except ValueError:
+            logger.warning(
+                "Invalid FMC_TIMEOUT=%s, falling back to 30 seconds", timeout_str
+            )
+            timeout = 30.0
+
+        domain_uuid = os.getenv("FMC_DOMAIN_UUID")
+
+        logger.debug(
+            "Loaded FMC settings base_url=%s verify_ssl=%s timeout=%s domain_uuid=%s",
+            base_url,
+            verify_ssl,
+            timeout,
+            domain_uuid,
+        )
+
+        return cls(
+            base_url=base_url.rstrip("/"),
+            username=username,
+            password=password,
+            verify_ssl=verify_ssl,
+            timeout=timeout,
+            domain_uuid=domain_uuid,
+        )
 
 
 class FMCClientError(Exception):
-    """Custom exception for FMC client errors."""
+    """Base exception for FMC client errors."""
+
+
+class FMCAuthError(FMCClientError):
+    """Authentication / token issues."""
+
+
+class FMCRequestError(FMCClientError):
+    """HTTP/network problems when talking to FMC."""
 
 
 class FMCClient:
     """
-    Simple synchronous FMC REST client using httpx.Client.
+    Minimal async FMC REST API client.
 
-    This is used inside FastMCP tools, which are synchronous functions.
+    This client is intentionally small and focused on:
+      - Auth / token management
+      - Domain resolution
+      - Listing devices / policies / rules
+      - Listing network-related objects
+
+    All methods are designed to be called from MCP tools, with solid logging
+    and defensive error handling.
     """
 
-    def __init__(
-        self,
-        base_url: str,
-        username: str,
-        password: str,
-        verify_ssl: bool = False,
-        timeout: float = 30.0,
-        default_domain_uuid: Optional[str] = None,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.username = username
-        self.password = password
-        self.verify_ssl = verify_ssl
-        self.timeout = timeout
-        self.default_domain_uuid = default_domain_uuid
+    def __init__(self, settings: FMCSettings) -> None:
+        self._settings = settings
+        self._access_token: Optional[str] = None
+        self._domain_uuid: Optional[str] = settings.domain_uuid
 
-        self._client = httpx.Client(
-            base_url=self.base_url,
-            verify=self.verify_ssl,
-            timeout=self.timeout,
-        )
-        self._auth_token: Optional[FMCAuthToken] = None
-        self._logger = logging.getLogger("FMCClient")
+    # ---- Token management ------------------------------------------------------------
 
-    # --------------------------- Auth / Tokens ---------------------------
+    @property
+    def settings(self) -> FMCSettings:
+        """Expose the settings in a read-only way for helpers."""
+        return self._settings
 
-    def _authenticate(self) -> FMCAuthToken:
-        """
-        Acquire a new FMC auth token.
-        """
-        self._logger.debug("Authenticating to FMC...")
-        url = "/api/fmc_platform/v1/auth/generatetoken"
-        resp = self._client.post(url, auth=(self.username, self.password))
+    async def _authenticate(self) -> None:
+        """Obtain FMC access + refresh tokens."""
+        url = f"{self._settings.base_url}/api/fmc_platform/v1/auth/generatetoken"
+        logger.debug("Authenticating to FMC at %s", url)
 
-        if resp.status_code not in (200, 204):
-            raise FMCClientError(
-                f"Failed to authenticate to FMC: {resp.status_code} {resp.text}"
+        try:
+            async with httpx.AsyncClient(
+                verify=self._settings.verify_ssl, timeout=self._settings.timeout
+            ) as client:
+                response = await client.post(
+                    url,
+                    auth=(self._settings.username, self._settings.password),
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.RequestError as exc:
+            logger.error("FMC auth request failed: %s", exc)
+            raise FMCAuthError(f"Failed to authenticate to FMC: {exc}") from exc
+
+        if response.status_code not in (200, 204):
+            logger.error(
+                "FMC auth failed with status %s: %s",
+                response.status_code,
+                response.text,
+            )
+            raise FMCAuthError(
+                f"Authentication failed with status {response.status_code}: {response.text}"
             )
 
-        headers = resp.headers
-        access_token = headers.get("X-auth-access-token")
-        refresh_token = headers.get("X-auth-refresh-token")
-        domain_uuid = headers.get("DOMAIN_UUID")
+        token = response.headers.get("X-auth-access-token")
+        if not token:
+            logger.error("FMC auth response did not include X-auth-access-token")
+            raise FMCAuthError("No X-auth-access-token returned by FMC")
 
-        if not access_token:
-            raise FMCClientError("FMC did not return X-auth-access-token header")
+        logger.debug("FMC auth successful, token obtained")
+        self._access_token = token
 
-        token = FMCAuthToken(
-            token=access_token,
-            refresh_token=refresh_token,
-            domain_uuid=domain_uuid,
-        )
-        self._auth_token = token
-        self._logger.info(
-            "Authenticated to FMC. Domain UUID from token: %s", domain_uuid
-        )
-        return token
+    async def _ensure_authenticated(self) -> None:
+        """Authenticate if we don't have a token yet."""
+        if not self._access_token:
+            await self._authenticate()
 
-    def _ensure_token(self) -> FMCAuthToken:
-        if self._auth_token is None:
-            return self._authenticate()
-        return self._auth_token
+    # ---- Domain resolution -----------------------------------------------------------
 
-    # --------------------------- Domain helpers --------------------------
-
-    def get_effective_domain_uuid(self, override: Optional[str] = None) -> str:
+    async def ensure_domain_uuid(self) -> str:
         """
-        Resolve the domain UUID to use for config calls:
+        Ensure we have a domain UUID to use in config URLs.
 
-        - If override is provided, use that.
-        - Else, if environment default is set, use that.
-        - Else, if token has a DOMAIN_UUID header, use that.
-        - Else, query /api/fmc_platform/v1/info/domain and pick the Global domain.
+        If FMCSettings.domain_uuid is provided, we use it as-is.
+        Otherwise we call /api/fmc_platform/v1/info/domain once and cache it.
         """
-        if override:
-            return override
-        if self.default_domain_uuid:
-            return self.default_domain_uuid
+        if self._domain_uuid:
+            return self._domain_uuid
 
-        token = self._ensure_token()
-        if token.domain_uuid:
-            return token.domain_uuid
+        await self._ensure_authenticated()
+        url = f"{self._settings.base_url}/api/fmc_platform/v1/info/domain"
+        logger.debug("Resolving FMC domain UUID via %s", url)
 
-        # Last resort: query the domain info
-        self._logger.debug("Resolving domain UUID via /info/domain")
-        resp = self._request(
-            "GET",
-            "/api/fmc_platform/v1/info/domain",
-            use_config_api=False,
-            include_domain=False,
-        )
-        items = resp.get("items", [])
+        try:
+            async with httpx.AsyncClient(
+                verify=self._settings.verify_ssl, timeout=self._settings.timeout
+            ) as client:
+                response = await client.get(
+                    url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-auth-access-token": self._access_token or "",
+                    },
+                )
+        except httpx.RequestError as exc:
+            logger.error("FMC domain info request failed: %s", exc)
+            raise FMCRequestError(f"Failed to query FMC domain info: {exc}") from exc
+
+        if response.status_code != 200:
+            logger.error(
+                "FMC domain info failed with status %s: %s",
+                response.status_code,
+                response.text,
+            )
+            raise FMCRequestError(
+                f"Domain info failed with status {response.status_code}: {response.text}"
+            )
+
+        data = response.json()
+        items = data.get("items") or []
         if not items:
-            raise FMCClientError("No domains returned from FMC /info/domain")
+            raise FMCRequestError("FMC domain info returned no domains")
 
-        # Prefer Global domain if present
-        for d in items:
-            if d.get("name") == "Global":
-                return d["id"]
+        # In single-domain scenarios, this is typically a single item
+        domain_uuid = items[0].get("uuid")
+        if not domain_uuid:
+            raise FMCRequestError("FMC domain info did not include a uuid")
 
-        # Otherwise fall back to the first domain
-        return items[0]["id"]
+        logger.info("Resolved FMC domain UUID to %s", domain_uuid)
+        self._domain_uuid = domain_uuid
+        return domain_uuid
 
-    # -------------------------- Low-level request ------------------------
+    # ---- Core request helper ---------------------------------------------------------
 
-    def _request(
+    async def _request_json(
         self,
         method: str,
         path: str,
         *,
         params: Optional[Dict[str, Any]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-        domain_uuid: Optional[str] = None,
-        use_config_api: bool = True,
-        include_domain: bool = True,
+        ignore_statuses: Optional[Set[int]] = None,
     ) -> Dict[str, Any]:
         """
-        Make an FMC REST call with automatic token handling.
+        Internal helper for authenticated JSON requests to config API.
 
-        If use_config_api=True, path is assumed relative to /api/fmc_config/v1.
-        If include_domain=True, we inject /domain/{uuid} into the path.
+        `ignore_statuses` lets some callers (e.g. FQDN/dynamicobjects on
+        older FMC) treat a 404 as "feature not available" instead of a hard
+        error. In that case we return an empty collection-style payload.
         """
-
-        # Build base API prefix
-        if use_config_api:
-            api_prefix = "/api/fmc_config/v1"
-        else:
-            api_prefix = "/api/fmc_platform/v1"
-
-        # Domain injection
-        if include_domain:
-            dom = self.get_effective_domain_uuid(domain_uuid)
-            if not path.startswith("/"):
-                path = "/" + path
-            path = f"{api_prefix}/domain/{dom}{path}"
-        else:
-            if not path.startswith("/"):
-                path = "/" + path
-            path = f"{api_prefix}{path}"
-
-        self._logger.debug("FMC request: %s %s params=%s", method, path, params)
-
-        token = self._ensure_token()
-        headers = {"X-auth-access-token": token.token}
-
-        resp = self._client.request(
-            method,
-            path,
-            params=params,
-            json=json_body,
-            headers=headers,
-        )
-
-        # Token expired?
-        if resp.status_code == 401:
-            self._logger.info("Token expired, re-authenticating...")
-            self._authenticate()
-            token = self._auth_token
-            headers = {"X-auth-access-token": token.token}
-            resp = self._client.request(
-                method,
-                path,
-                params=params,
-                json=json_body,
-                headers=headers,
-            )
-
-        if resp.status_code not in (200, 201, 202, 204):
-            raise FMCClientError(
-                f"FMC API error: {resp.status_code} {resp.text}"
-            )
-
-        if resp.status_code == 204:
-            return {}
-        try:
-            return resp.json()
-        except json.JSONDecodeError:
-            return {}
-
-    # --------------------------- FMC helpers -----------------------------
-
-    def list_access_policies(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        """
-        Return all Access Policies in the given domain.
-        """
-        items: List[Dict[str, Any]] = []
-        offset = 0
-        limit = 50
-
-        while True:
-            params = {"offset": offset, "limit": limit}
-            data = self._request(
-                "GET",
-                "/policy/accesspolicies",
-                params=params,
-                domain_uuid=domain_uuid,
-            )
-            batch = data.get("items", [])
-            items.extend(batch)
-
-            paging = data.get("paging") or {}
-            total = paging.get("count", len(batch))
-            if offset + limit >= total:
-                break
-            offset += limit
-
-        return items
-
-    def list_access_rules_for_policy(
-        self,
-        policy_id: str,
-        domain_uuid: Optional[str] = None,
-        expanded: bool = True,
-    ) -> List[Dict]:
-        """
-        Return all Access Rules for the given Access Policy.
-        """
-        items: List[Dict[str, Any]] = []
-        offset = 0
-        limit = 50
-
-        while True:
-            params = {"offset": offset, "limit": limit}
-            if expanded:
-                params["expanded"] = "true"
-            data = self._request(
-                "GET",
-                f"/policy/accesspolicies/{policy_id}/accessrules",
-                params=params,
-                domain_uuid=domain_uuid,
-            )
-            batch = data.get("items", [])
-            items.extend(batch)
-
-            paging = data.get("paging") or {}
-            total = paging.get("count", len(batch))
-            if offset + limit >= total:
-                break
-            offset += limit
-
-        return items
-
-    def list_devices(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        """
-        Return all devices (FTDs) known to FMC.
-        """
-        items: List[Dict[str, Any]] = []
-        offset = 0
-        limit = 50
-
-        while True:
-            params = {"offset": offset, "limit": limit}
-            data = self._request(
-                "GET",
-                "/device/devicerecords",
-                params=params,
-                domain_uuid=domain_uuid,
-            )
-            batch = data.get("items", [])
-            items.extend(batch)
-
-            paging = data.get("paging") or {}
-            total = paging.get("count", len(batch))
-            if offset + limit >= total:
-                break
-            offset += limit
-
-        return items
-
-    def get_device(self, device_id: str, domain_uuid: Optional[str] = None) -> Dict:
-        """
-        Get details for a single device.
-        """
-        return self._request(
-            "GET",
-            f"/device/devicerecords/{device_id}",
-            domain_uuid=domain_uuid,
-        )
-
-    def list_device_ha_pairs(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        """
-        Return all HA pairs.
-        """
-        items: List[Dict[str, Any]] = []
-        offset = 0
-        limit = 50
-
-        while True:
-            params = {"offset": offset, "limit": limit}
-            data = self._request(
-                "GET",
-                "/device/ftddevicehapairs",
-                params=params,
-                domain_uuid=domain_uuid,
-            )
-            batch = data.get("items", [])
-            items.extend(batch)
-
-            paging = data.get("paging") or {}
-            total = paging.get("count", len(batch))
-            if offset + limit >= total:
-                break
-            offset += limit
-
-        return items
-
-    def list_device_clusters(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        """
-        Return all FTD clusters.
-        """
-        items: List[Dict[str, Any]] = []
-        offset = 0
-        limit = 50
-
-        while True:
-            params = {"offset": offset, "limit": limit}
-            data = self._request(
-                "GET",
-                "/device/ftddevicecluster",
-                params=params,
-                domain_uuid=domain_uuid,
-            )
-            batch = data.get("items", [])
-            items.extend(batch)
-
-            paging = data.get("paging") or {}
-            total = paging.get("count", len(batch))
-            if offset + limit >= total:
-                break
-            offset += limit
-
-        return items
-
-    def get_access_policy_for_device(
-        self,
-        device_id: str,
-        domain_uuid: Optional[str] = None,
-    ) -> Optional[Dict]:
-        """
-        Resolve which Access Policy is applied to the given device.
-        """
-        dev = self.get_device(device_id, domain_uuid=domain_uuid)
-        acp = dev.get("accessPolicy")
-        if not acp:
-            return None
-        return acp
-
-    # Network objects
-    def list_hosts(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        return self._list_paginated_objects("/object/hosts", domain_uuid)
-
-    def list_networks(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        return self._list_paginated_objects("/object/networks", domain_uuid)
-
-    def list_ranges(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        return self._list_paginated_objects("/object/ranges", domain_uuid)
-
-    def list_fqdns(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        """
-        FMC FQDN objects (where available).
-        """
-        return self._list_paginated_objects("/object/fqdns", domain_uuid)
-
-    def list_network_groups(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        return self._list_paginated_objects("/object/networkgroups", domain_uuid)
-
-    def list_dynamic_objects(self, domain_uuid: Optional[str] = None) -> List[Dict]:
-        """
-        FMC Dynamic Objects.
-        """
-        return self._list_paginated_objects("/object/dynamicobjects", domain_uuid)
-
-    def _list_paginated_objects(
-        self,
-        path: str,
-        domain_uuid: Optional[str] = None,
-        limit: int = 100,
-    ) -> List[Dict]:
-        items: List[Dict[str, Any]] = []
-        offset = 0
-
-        while True:
-            params = {"offset": offset, "limit": limit}
-            data = self._request(
-                "GET",
-                path,
-                params=params,
-                domain_uuid=domain_uuid,
-            )
-            batch = data.get("items", [])
-            items.extend(batch)
-
-            paging = data.get("paging") or {}
-            total = paging.get("count", len(batch))
-            if offset + limit >= total:
-                break
-            offset += limit
-
-        return items
-
-
-# Global singleton FMC client for tools
-fmc_client = FMCClient(
-    base_url=FMC_BASE_URL,
-    username=FMC_USERNAME or "",
-    password=FMC_PASSWORD or "",
-    verify_ssl=FMC_VERIFY_SSL,
-    timeout=FMC_TIMEOUT,
-    default_domain_uuid=FMC_DOMAIN_UUID,
-)
-
-# -----------------------------------------------------------------------------
-# Network object indexing / indicator classification
-# -----------------------------------------------------------------------------
-
-@dataclass
-class IndexEntry:
-    id: str
-    name: str
-    type: str
-    kind: str  # "host", "network", "range", "fqdn", "group", "dynamic"
-    value: Any
-
-
-@dataclass
-class NetworkObjectIndex:
-    """
-    Index of FMC network and FQDN objects.
-
-    For now we handle:
-      - Host
-      - Network
-      - Range
-      - FQDN (FQDN objects)
-      - NetworkGroup
-      - DynamicObject
-    """
-
-    hosts_by_ip: Dict[str, List[IndexEntry]] = field(default_factory=dict)
-    networks: List[Tuple[ipaddress._BaseNetwork, IndexEntry]] = field(
-        default_factory=list
-    )
-    ranges: List[Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress, IndexEntry]] = field(
-        default_factory=list
-    )
-    fqdns_by_name: Dict[str, List[IndexEntry]] = field(default_factory=dict)
-    groups_by_id: Dict[str, IndexEntry] = field(default_factory=dict)
-    dynamic_by_id: Dict[str, IndexEntry] = field(default_factory=dict)
-
-    logger: logging.Logger = field(
-        default_factory=lambda: logging.getLogger("NetworkObjectIndex")
-    )
-
-    # --------------- Construction helpers ---------------
-
-    @classmethod
-    def build_from_fmc(
-        cls,
-        client: FMCClient,
-        domain_uuid: Optional[str] = None,
-    ) -> "NetworkObjectIndex":
-        """
-        Build index by fetching FMC objects once.
-        """
-        logger = logging.getLogger("NetworkObjectIndex")
-        logger.info("Building FMC network object index...")
-
-        hosts = client.list_hosts(domain_uuid=domain_uuid)
-        networks = client.list_networks(domain_uuid=domain_uuid)
-        ranges = client.list_ranges(domain_uuid=domain_uuid)
-
-        try:
-            fqdns = client.list_fqdns(domain_uuid=domain_uuid)
-        except FMCClientError:
-            logger.warning("FMC FQDN endpoint not available, skipping.")
-            fqdns = []
-
-        groups = client.list_network_groups(domain_uuid=domain_uuid)
-        try:
-            dynamic = client.list_dynamic_objects(domain_uuid=domain_uuid)
-        except FMCClientError:
-            logger.warning("FMC dynamic objects endpoint not available, skipping.")
-            dynamic = []
-
-        index = cls()
-        index.logger = logger
-
-        for h in hosts:
-            ip = h.get("value")
-            if not ip:
-                continue
-            try:
-                ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-
-            entry = IndexEntry(
-                id=h["id"],
-                name=h.get("name", ""),
-                type=h["type"],
-                kind="host",
-                value=ip,
-            )
-            index.hosts_by_ip.setdefault(ip, []).append(entry)
-
-        for n in networks:
-            val = n.get("value")
-            if not val:
-                continue
-            try:
-                net = ipaddress.ip_network(val, strict=False)
-            except ValueError:
-                continue
-
-            entry = IndexEntry(
-                id=n["id"],
-                name=n.get("name", ""),
-                type=n["type"],
-                kind="network",
-                value=str(net),
-            )
-            index.networks.append((net, entry))
-
-        for r in ranges:
-            first_ip = r.get("value")
-            last_ip = r.get("endValue") or r.get("valueEnd")
-            if not first_ip or not last_ip:
-                continue
-            try:
-                start = ipaddress.ip_address(first_ip)
-                end = ipaddress.ip_address(last_ip)
-            except ValueError:
-                continue
-
-            entry = IndexEntry(
-                id=r["id"],
-                name=r.get("name", ""),
-                type=r["type"],
-                kind="range",
-                value=(str(start), str(end)),
-            )
-            index.ranges.append((start, end, entry))
-
-        for f in fqdns:
-            fqdn_value = f.get("fqdn") or f.get("value") or f.get("name")
-            if not fqdn_value:
-                continue
-            fqdn_norm = fqdn_value.lower().rstrip(".")
-            entry = IndexEntry(
-                id=f["id"],
-                name=f.get("name", ""),
-                type=f["type"],
-                kind="fqdn",
-                value=fqdn_norm,
-            )
-            index.fqdns_by_name.setdefault(fqdn_norm, []).append(entry)
-
-        for g in groups:
-            entry = IndexEntry(
-                id=g["id"],
-                name=g.get("name", ""),
-                type=g["type"],
-                kind="group",
-                value=g,
-            )
-            index.groups_by_id[entry.id] = entry
-
-        for d in dynamic:
-            entry = IndexEntry(
-                id=d["id"],
-                name=d.get("name", ""),
-                type=d["type"],
-                kind="dynamic",
-                value=d,
-            )
-            index.dynamic_by_id[entry.id] = entry
-
-        logger.info(
-            "Network object index built: %d hosts, %d networks, %d ranges, "
-            "%d FQDNs, %d groups, %d dynamic objects",
-            len(index.hosts_by_ip),
-            len(index.networks),
-            len(index.ranges),
-            len(index.fqdns_by_name),
-            len(index.groups_by_id),
-            len(index.dynamic_by_id),
-        )
-
-        return index
-
-    # --------------- Matching helpers ---------------
-
-    def classify_indicator(self, indicator: str) -> str:
-        """
-        Classify indicator as "ip", "network", or "fqdn".
-        """
-        # Try IP
-        try:
-            ipaddress.ip_address(indicator)
-            return "ip"
-        except ValueError:
-            pass
-
-        # Try CIDR
-        try:
-            ipaddress.ip_network(indicator, strict=False)
-            return "network"
-        except ValueError:
-            pass
-
-        # Fallback to fqdn
-        return "fqdn"
-
-    def find_matches_for_indicator(self, indicator: str) -> Dict[str, Any]:
-        """
-        Return a dictionary of matched objects for the given indicator.
-        """
-        kind = self.classify_indicator(indicator)
-        result: Dict[str, Any] = {
-            "indicator": indicator,
-            "indicator_type": kind,
-            "matched_hosts": [],
-            "matched_networks": [],
-            "matched_ranges": [],
-            "matched_fqdns": [],
-            "matched_groups": [],
-            "matched_dynamic_objects": [],
+        await self._ensure_authenticated()
+        if not self._access_token:
+            raise FMCAuthError("No access token, authentication failed")
+
+        url = f"{self._settings.base_url}{path}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-auth-access-token": self._access_token,
         }
 
-        if kind == "ip":
+        logger.debug("FMC request %s %s params=%s", method, url, params)
+
+        try:
+            async with httpx.AsyncClient(
+                verify=self._settings.verify_ssl, timeout=self._settings.timeout
+            ) as client:
+                response = await client.request(
+                    method=method, url=url, headers=headers, params=params
+                )
+        except httpx.RequestError as exc:
+            logger.error("FMC %s %s failed: %s", method, url, exc)
+            raise FMCRequestError(f"FMC {method} {url} failed: {exc}") from exc
+
+        # Token expired? Try once to refresh and retry.
+        if response.status_code == 401:
+            logger.warning("FMC request got 401, refreshing token and retrying once")
+            self._access_token = None
+            await self._ensure_authenticated()
+            headers["X-auth-access-token"] = self._access_token or ""
             try:
-                ip_obj = ipaddress.ip_address(indicator)
-            except ValueError:
-                return result
+                async with httpx.AsyncClient(
+                    verify=self._settings.verify_ssl,
+                    timeout=self._settings.timeout,
+                ) as client:
+                    response = await client.request(
+                        method=method, url=url, headers=headers, params=params
+                    )
+            except httpx.RequestError as exc:
+                logger.error(
+                    "FMC %s %s failed after token refresh: %s", method, url, exc
+                )
+                raise FMCRequestError(
+                    f"FMC {method} {url} failed after token refresh: {exc}"
+                ) from exc
 
-            # direct host match
-            for entry in self.hosts_by_ip.get(indicator, []):
-                result["matched_hosts"].append(entry.__dict__)
+        if ignore_statuses and response.status_code in ignore_statuses:
+            logger.info(
+                "FMC %s %s got status %s (ignored)",
+                method,
+                url,
+                response.status_code,
+            )
+            # Return an "empty list" style payload
+            return {"items": [], "paging": {}}
 
-            # networks containing IP
-            for net, entry in self.networks:
-                if ip_obj in net:
-                    result["matched_networks"].append(entry.__dict__)
+        if response.status_code < 200 or response.status_code >= 300:
+            logger.error(
+                "FMC %s %s failed with status %s: %s",
+                method,
+                url,
+                response.status_code,
+                response.text,
+            )
+            raise FMCRequestError(
+                f"FMC {method} {url} failed with status {response.status_code}: {response.text}"
+            )
 
-            # ranges containing IP
-            for start, end, entry in self.ranges:
-                if start <= ip_obj <= end:
-                    result["matched_ranges"].append(entry.__dict__)
+        try:
+            return response.json()
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "FMC %s %s returned non-JSON response: %s", method, url, response.text
+            )
+            raise FMCRequestError(
+                f"FMC {method} {url} returned invalid JSON: {exc}"
+            ) from exc
 
-        elif kind == "network":
-            try:
-                net_indicator = ipaddress.ip_network(indicator, strict=False)
-            except ValueError:
-                return result
+    async def _list_paginated(
+        self,
+        path_suffix: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        limit: int = 1000,
+        hard_page_limit: int = 20,
+        expanded: bool = False,
+        ignore_statuses: Optional[Set[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generic 'list with paging' helper for FMC config endpoints.
+        Supports:
+          - limit/offset pagination
+          - optional expanded=true
+          - optional ignore_statuses (e.g. 404 on older FMC)
+        """
+        domain_uuid = await self.ensure_domain_uuid()
+        path = f"/api/fmc_config/v1/domain/{domain_uuid}{path_suffix}"
 
-            # hosts inside network
-            for ip_str, entries in self.hosts_by_ip.items():
-                ip_obj = ipaddress.ip_address(ip_str)
-                if ip_obj in net_indicator:
-                    for e in entries:
-                        result["matched_hosts"].append(e.__dict__)
+        all_items: List[Dict[str, Any]] = []
+        offset = 0
+        page_count = 0
 
-            # overlapping networks
-            for net, entry in self.networks:
-                if net.overlaps(net_indicator):
-                    result["matched_networks"].append(entry.__dict__)
+        base_params = params.copy() if params else {}
+        base_params.setdefault("limit", limit)
+        if expanded:
+            base_params.setdefault("expanded", "true")
 
-            # ranges that intersect
-            for start, end, entry in self.ranges:
-                if start <= net_indicator.broadcast_address and end >= net_indicator.network_address:
-                    result["matched_ranges"].append(entry.__dict__)
+        while True:
+            query_params = base_params.copy()
+            query_params["offset"] = offset
 
-        else:  # fqdn
-            fqdn_norm = indicator.lower().rstrip(".")
-            for entry in self.fqdns_by_name.get(fqdn_norm, []):
-                result["matched_fqdns"].append(entry.__dict__)
+            data = await self._request_json(
+                "GET", path, params=query_params, ignore_statuses=ignore_statuses
+            )
+            items = data.get("items") or []
+            paging = data.get("paging") or {}
 
-        return result
+            all_items.extend(items)
+            page_count += 1
+
+            logger.debug(
+                "FMC paging path=%s page=%s got=%s total so far=%s",
+                path,
+                page_count,
+                len(items),
+                len(all_items),
+            )
+
+            if not items:
+                break
+
+            # 'paging.next' style
+            next_link = paging.get("next")
+            if not next_link:
+                break
+
+            # FMC uses explicit next offset; but to keep it robust, we can
+            # also just increment by 'limit' if needed.
+            next_offset = paging.get("offset", offset + limit)
+            offset = next_offset
+
+            if page_count >= hard_page_limit:
+                logger.warning(
+                    "FMC paging for %s hit hard_page_limit=%s, stopping",
+                    path,
+                    hard_page_limit,
+                )
+                break
+
+        return all_items
+
+    # ---- Device & policy helpers -----------------------------------------------------
+
+    async def list_device_records(self) -> List[Dict[str, Any]]:
+        """
+        List device records (FTD/ASA/etc.) from FMC.
+
+        Uses:
+          GET /api/fmc_config/v1/domain/{domain_UUID}/devices/devicerecords
+        """
+        return await self._list_paginated(
+            "/devices/devicerecords",
+            expanded=True,
+            hard_page_limit=5,
+        )
+
+    async def list_device_ha_pairs(self) -> List[Dict[str, Any]]:
+        """
+        List HA pairs from FMC.
+
+        Uses:
+          GET /api/fmc_config/v1/domain/{domain_UUID}/devices/ftddevicehapairs
+        """
+        return await self._list_paginated(
+            "/devices/ftddevicehapairs",
+            expanded=True,
+            hard_page_limit=5,
+        )
+
+    async def list_device_clusters(self) -> List[Dict[str, Any]]:
+        """
+        List device clusters from FMC.
+
+        Uses:
+          GET /api/fmc_config/v1/domain/{domain_UUID}/devices/ftddeviceclusters
+        """
+        return await self._list_paginated(
+            "/devices/ftddeviceclusters",
+            expanded=True,
+            hard_page_limit=5,
+        )
+
+    async def list_policy_assignments(self) -> List[Dict[str, Any]]:
+        """
+        List policy assignments.
+
+        Uses:
+          GET /api/fmc_config/v1/domain/{domain_UUID}/assignment/policyassignments
+        """
+        return await self._list_paginated(
+            "/assignment/policyassignments",
+            expanded=True,
+            hard_page_limit=5,
+        )
+
+    # ---- Access policies & rules -----------------------------------------------------
+
+    async def list_access_policies(
+        self,
+        *,
+        limit: int = 1000,
+        hard_page_limit: int = 10,
+        expanded: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve Access Control Policies in the current domain.
+
+        Wraps:
+          GET /api/fmc_config/v1/domain/{domain_UUID}/policy/accesspolicies
+        """
+        params: Dict[str, Any] = {}
+        return await self._list_paginated(
+            "/policy/accesspolicies",
+            params=params,
+            limit=limit,
+            hard_page_limit=hard_page_limit,
+            expanded=expanded,
+        )
+
+    async def list_access_rules(
+        self,
+        access_policy_id: str,
+        *,
+        limit: int = 1000,
+        hard_page_limit: int = 10,
+        expanded: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve access control rules for a given Access Policy.
+
+        Uses:
+          GET /api/fmc_config/v1/domain/{domain_UUID}/policy/accesspolicies/{policy_UUID}/accessrules
+          with limit/offset + paging.next pagination.
+        """
+        params: Dict[str, Any] = {}
+        path_suffix = f"/policy/accesspolicies/{access_policy_id}/accessrules"
+
+        return await self._list_paginated(
+            path_suffix,
+            params=params,
+            limit=limit,
+            hard_page_limit=hard_page_limit,
+            expanded=expanded,
+        )
+
+    # ---- Network object helpers ------------------------------------------------------
+
+    async def list_host_objects(self) -> List[Dict[str, Any]]:
+        """List /object/hosts."""
+        return await self._list_paginated(
+            "/object/hosts",
+            expanded=True,
+        )
+
+    async def list_network_objects(self) -> List[Dict[str, Any]]:
+        """List /object/networks."""
+        return await self._list_paginated(
+            "/object/networks",
+            expanded=True,
+        )
+
+    async def list_range_objects(self) -> List[Dict[str, Any]]:
+        """List /object/ranges."""
+        return await self._list_paginated(
+            "/object/ranges",
+            expanded=True,
+        )
+
+    async def list_fqdn_objects(self) -> List[Dict[str, Any]]:
+        """
+        List /object/fqdns.
+
+        On older FMC where this endpoint does not exist, a 404 is treated as
+        "no FQDN objects" instead of an error.
+        """
+        return await self._list_paginated(
+            "/object/fqdns",
+            expanded=True,
+            ignore_statuses={404},
+        )
+
+    async def list_network_groups(self) -> List[Dict[str, Any]]:
+        """List /object/networkgroups."""
+        return await self._list_paginated(
+            "/object/networkgroups",
+            expanded=True,
+        )
+
+    async def list_dynamic_objects(self) -> List[Dict[str, Any]]:
+        """
+        List /object/dynamicobjects.
+
+        On older FMC where this endpoint does not exist, a 404 is treated as
+        "no dynamic objects" instead of an error.
+
+        Paging is limited by DYNAMICOBJECT_HARD_PAGE_LIMIT to avoid hammering FMC.
+        """
+        return await self._list_paginated(
+            "/object/dynamicobjects",
+            expanded=True,
+            hard_page_limit=DYNAMICOBJECT_HARD_PAGE_LIMIT,
+            ignore_statuses={404},
+        )
 
 
-# -----------------------------------------------------------------------------
-# Rule inspection helpers
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# IP / FQDN matching helpers
+# --------------------------------------------------------------------------------------
 
-def _extract_literal_ips(rule: Dict[str, Any], direction: str) -> List[str]:
+
+class QueryKind:
+    IP = "ip"
+    NETWORK = "network"
+    FQDN = "fqdn"
+
+
+def parse_query(query: str) -> Tuple[str, Any]:
     """
-    Extract literal IPs/CIDRs from sourceNetworks/destinationNetworks .literals.
+    Parse the user query into IP / network / fqdn.
+
+    Returns:
+      (kind, value)
     """
-    key = f"{direction}Networks"
-    literals: List[str] = []
-    nets = rule.get(key, {})
-    for lit in nets.get("literals", []):
-        val = lit.get("value")
-        if not val:
-            continue
-        literals.append(val)
-    return literals
+    q = query.strip()
+
+    # Try IP or network
+    try:
+        if "/" in q:
+            net = ipaddress.ip_network(q, strict=False)
+            return (QueryKind.NETWORK, net)
+        else:
+            ip = ipaddress.ip_address(q)
+            return (QueryKind.IP, ip)
+    except ValueError:
+        # Not an IP, treat as FQDN-ish string
+        return (QueryKind.FQDN, q.lower())
 
 
-def _extract_network_object_refs(rule: Dict[str, Any], direction: str) -> List[Dict]:
+def parse_literal_value(value: str) -> Tuple[str, Any]:
     """
-    Extract network object references (objects list) for source/destination.
+    Interpret a literal's 'value' field in FMC rule (IP, CIDR, FQDN, etc.).
     """
-    key = f"{direction}Networks"
-    refs: List[Dict[str, Any]] = []
-    nets = rule.get(key, {})
-    for obj in nets.get("objects", []):
-        refs.append(obj)
-    return refs
+    v = value.strip()
+    try:
+        if "/" in v:
+            net = ipaddress.ip_network(v, strict=False)
+            return (QueryKind.NETWORK, net)
+        else:
+            ip = ipaddress.ip_address(v)
+            return (QueryKind.IP, ip)
+    except ValueError:
+        return (QueryKind.FQDN, v.lower())
 
 
-def _extract_sgt_objects(rule: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
-    """
-    Extract sourceSecurityGroupTags / destinationSecurityGroupTags.
-    """
-    key = f"{direction}SecurityGroupTags"
-    container = rule.get(key, {})
-    return container.get("objects", [])
+# Strict indicator validation helpers --------------------------------------------------
+
+# Stricter FQDN: at least one dot, labels 1–63 chars, and last label letters only (2+)
+FQDN_PATTERN = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*"
+    r"\.[A-Za-z]{2,}$"
+)
 
 
-def _extract_realm_users(rule: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract realm User / UserGroup information from rule["users"].
-    """
-    users_obj = rule.get("users") or {}
-    objs = users_obj.get("objects", [])
-    realm_users: List[Dict[str, Any]] = []
-    realm_groups: List[Dict[str, Any]] = []
-
-    for obj in objs:
-        t = obj.get("type")
-        if t == "RealmUser":
-            realm_users.append(obj)
-        elif t == "RealmUserGroup":
-            realm_groups.append(obj)
-
-    return {
-        "realm_users": realm_users,
-        "realm_groups": realm_groups,
-    }
+class InvalidIndicatorError(ValueError):
+    """Raised when the indicator string is not a valid IP, CIDR, or FQDN."""
 
 
-def _extract_zones(rule: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
-    """
-    Extract sourceZones / destinationZones objects.
-    """
-    key = f"{direction}Zones"
-    container = rule.get(key, {})
-    return container.get("objects", [])
-
-
-def _extract_dynamic_objects(rule: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
-    """
-    Extract sourceDynamicObjects / destinationDynamicObjects objects.
-    """
-    key = f"{direction}DynamicObjects"
-    container = rule.get(key, {})
-    return container.get("objects", [])
-
-
-def _extract_applications(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Extract application objects from rule["applications"]["applications"].
-    """
-    apps_container = rule.get("applications") or {}
-    return apps_container.get("applications", [])
-
-
-def _extract_urls(rule: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract URL objects and URL categories with reputation.
-    """
-    urls = rule.get("urls") or {}
-    objects = urls.get("objects", [])
-    cats = urls.get("urlCategoriesWithReputation", [])
-    return {"objects": objects, "categories": cats}
-
-
-def _extract_ports(rule: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
-    """
-    Extract sourcePorts / destinationPorts objects.
-    (Note: FMC uses one 'destinationPorts' field in Access Rules,
-     but helper kept generic for symmetry.)
-    """
-    key = f"{direction}Ports"
-    container = rule.get(key, {})
-    return container.get("objects", [])
-
-
-def _extract_file_policy(rule: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Extract filePolicy object, if any.
-    """
-    return rule.get("filePolicy")
-
-
-def _extract_ips_policy(rule: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Extract ipsPolicy object, if any.
-    """
-    return rule.get("ipsPolicy")
-
-
-def _basic_rule_summary(rule: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Summarize rule with key attributes plus network-related context.
-    """
-    meta = rule.get("metadata") or {}
-    access_policy = meta.get("accessPolicy") or {}
-
-    sgt_src = _extract_sgt_objects(rule, "source")
-    sgt_dst = _extract_sgt_objects(rule, "destination")
-    realm_info = _extract_realm_users(rule)
-    zones_src = _extract_zones(rule, "source")
-    zones_dst = _extract_zones(rule, "destination")
-    dyn_src = _extract_dynamic_objects(rule, "source")
-    dyn_dst = _extract_dynamic_objects(rule, "destination")
-    apps = _extract_applications(rule)
-    url_info = _extract_urls(rule)
-    dst_ports = _extract_ports(rule, "destination")
-    file_policy = _extract_file_policy(rule)
-    ips_policy = _extract_ips_policy(rule)
-
-    return {
-        "id": rule.get("id"),
-        "name": rule.get("name"),
-        "action": rule.get("action"),
-        "enabled": rule.get("enabled", True),
-        "section": meta.get("section"),
-        "category": meta.get("category"),
-        "ruleIndex": meta.get("ruleIndex"),
-        "accessPolicy": {
-            "id": access_policy.get("id"),
-            "name": access_policy.get("name"),
-        },
-        "sendEventsToFMC": rule.get("sendEventsToFMC"),
-        "enableSyslog": rule.get("enableSyslog"),
-        "logBegin": rule.get("logBegin"),
-        "logEnd": rule.get("logEnd"),
-        "sgt": {
-            "source": sgt_src,
-            "destination": sgt_dst,
-        },
-        "realm": realm_info,
-        "zones": {
-            "source": zones_src,
-            "destination": zones_dst,
-        },
-        "dynamicObjects": {
-            "source": dyn_src,
-            "destination": dyn_dst,
-        },
-        "applications": apps,
-        "urls": url_info,
-        "destinationPorts": dst_ports,
-        "filePolicy": file_policy,
-        "ipsPolicy": ips_policy,
-        # leave room for network-object match details
-        "source_literal_matches": [],
-        "destination_literal_matches": [],
-        "source_object_matches": [],
-        "destination_object_matches": [],
-    }
-
-
-# -----------------------------------------------------------------------------
-# Rule search core logic (policy-centric)
-# -----------------------------------------------------------------------------
-
-def _match_rule_against_indicator(
-    rule: Dict[str, Any],
+def classify_indicator(
     indicator: str,
-    index: NetworkObjectIndex,
-) -> Optional[Dict[str, Any]]:
+    indicator_type: str = "auto",
+) -> Tuple[str, Any]:
+    """Validate and classify an indicator string as IP, NETWORK, or FQDN.
+
+    Builds on :func:`parse_query` but adds stricter checks for FQDNs and
+    honours the optional ``indicator_type`` hint.
+
+    Args:
+        indicator: Raw indicator string from the user (IP, CIDR, or FQDN).
+        indicator_type:
+            - "auto"  : infer kind from the value (default)
+            - "ip"    : must be a single IP address
+            - "subnet": must be a CIDR network
+            - "fqdn"  : must be a valid FQDN
     """
-    Return a rule summary with match details if rule references the indicator
-    in source/dest networks (literals or objects). Otherwise None.
+    kind, value = parse_query(indicator)
+    value_str = str(value)
+
+    # Additional guard: strings that *look* like IPv4 dotted-decimal but are invalid
+    # (e.g. "192.999.0.1") should not silently become FQDNs in "auto" mode.
+    looks_like_ipv4 = bool(re.fullmatch(r"\d+(\.\d+){1,3}", indicator.strip()))
+
+    # Enforce stricter FQDN syntax and require alphabetic characters
+    if kind == QueryKind.FQDN:
+        has_alpha = bool(re.search(r"[A-Za-z]", value_str))
+        if indicator_type == "auto":
+            if looks_like_ipv4 or not has_alpha or not FQDN_PATTERN.match(value_str):
+                raise InvalidIndicatorError(
+                    f"'{indicator}' is not a valid IP, CIDR, or FQDN."
+                )
+        else:  # indicator_type == 'fqdn' or any explicit
+            if not has_alpha or not FQDN_PATTERN.match(value_str):
+                raise InvalidIndicatorError(
+                    f"'{indicator}' is not a syntactically valid FQDN."
+                )
+
+    if indicator_type == "auto":
+        return kind, value
+
+    if indicator_type == "ip":
+        if kind != QueryKind.IP:
+            raise InvalidIndicatorError(
+                f"Expected an IP address but got '{kind}' for '{indicator}'."
+            )
+        return kind, value
+
+    if indicator_type == "subnet":
+        if kind != QueryKind.NETWORK:
+            raise InvalidIndicatorError(
+                f"Expected a CIDR network but got '{kind}' for '{indicator}'."
+            )
+        return kind, value
+
+    if indicator_type == "fqdn":
+        if kind != QueryKind.FQDN:
+            raise InvalidIndicatorError(
+                f"Expected an FQDN but got '{kind}' for '{indicator}'."
+            )
+        return kind, value
+
+    raise InvalidIndicatorError(
+        "Unsupported indicator_type '%s'. Use 'auto', 'ip', 'subnet', or 'fqdn'."
+        % indicator_type
+    )
+
+
+def literal_matches(query_kind: str, query_value: Any, literal: Dict[str, Any]) -> bool:
     """
-    indicator_type = index.classify_indicator(indicator)
-    matches_source_literals: List[str] = []
-    matches_dest_literals: List[str] = []
-    source_object_matches: List[Dict[str, Any]] = []
-    dest_object_matches: List[Dict[str, Any]] = []
+    Check whether a rule literal matches the query.
 
-    # Literal matches
-    src_lits = _extract_literal_ips(rule, "source")
-    dst_lits = _extract_literal_ips(rule, "destination")
-
-    if indicator_type in ("ip", "network"):
-        # IP/CIDR literal matching
-        for lit in src_lits:
-            try:
-                if indicator_type == "ip":
-                    ip_obj = ipaddress.ip_address(lit)
-                    ip_ind = ipaddress.ip_address(indicator)
-                    if ip_obj == ip_ind:
-                        matches_source_literals.append(lit)
-                else:
-                    net_lit = ipaddress.ip_network(lit, strict=False)
-                    net_ind = ipaddress.ip_network(indicator, strict=False)
-                    if net_lit.overlaps(net_ind):
-                        matches_source_literals.append(lit)
-            except ValueError:
-                continue
-
-        for lit in dst_lits:
-            try:
-                if indicator_type == "ip":
-                    ip_obj = ipaddress.ip_address(lit)
-                    ip_ind = ipaddress.ip_address(indicator)
-                    if ip_obj == ip_ind:
-                        matches_dest_literals.append(lit)
-                else:
-                    net_lit = ipaddress.ip_network(lit, strict=False)
-                    net_ind = ipaddress.ip_network(indicator, strict=False)
-                    if net_lit.overlaps(net_ind):
-                        matches_dest_literals.append(lit)
-            except ValueError:
-                continue
-
-    else:
-        # FQDN literal? Some deployments might put FQDN in literal "value"
-        fqdn_norm = indicator.lower().rstrip(".")
-        for lit in src_lits:
-            if lit.lower().rstrip(".") == fqdn_norm:
-                matches_source_literals.append(lit)
-        for lit in dst_lits:
-            if lit.lower().rstrip(".") == fqdn_norm:
-                matches_dest_literals.append(lit)
-
-    # Object matches
-    src_objs = _extract_network_object_refs(rule, "source")
-    dst_objs = _extract_network_object_refs(rule, "destination")
-
-    indicator_matches = index.find_matches_for_indicator(indicator)
-    # hosts
-    host_ids = {h["id"] for h in indicator_matches["matched_hosts"]}
-    # networks
-    net_ids = {n["id"] for n in indicator_matches["matched_networks"]}
-    # ranges
-    range_ids = {r["id"] for r in indicator_matches["matched_ranges"]}
-    # fqdns
-    fqdn_ids = {f["id"] for f in indicator_matches["matched_fqdns"]}
-    # groups
-    group_ids = {g["id"] for g in indicator_matches["matched_groups"]}
-    # dynamic
-    dyn_ids = {d["id"] for d in indicator_matches["matched_dynamic_objects"]}
-
-    def _obj_matches(obj: Dict[str, Any]) -> bool:
-        oid = obj.get("id")
-        if not oid:
-            return False
-        if oid in host_ids or oid in net_ids or oid in range_ids:
-            return True
-        if oid in fqdn_ids or oid in group_ids or oid in dyn_ids:
-            return True
+    This implementation only considers 'value' from literals under:
+      - sourceNetworks.literals
+      - destinationNetworks.literals
+    """
+    raw_value = str(literal.get("value", "")).strip()
+    if not raw_value:
         return False
 
-    for obj in src_objs:
-        if _obj_matches(obj):
-            source_object_matches.append(obj)
+    lit_kind, lit_value = parse_literal_value(raw_value)
 
-    for obj in dst_objs:
-        if _obj_matches(obj):
-            dest_object_matches.append(obj)
+    if query_kind == QueryKind.IP:
+        if lit_kind == QueryKind.IP:
+            return query_value == lit_value
+        if lit_kind == QueryKind.NETWORK:
+            return query_value in lit_value
+        return False
 
-    if (
-        not matches_source_literals
-        and not matches_dest_literals
-        and not source_object_matches
-        and not dest_object_matches
-    ):
-        return None
+    if query_kind == QueryKind.NETWORK:
+        if lit_kind == QueryKind.IP:
+            return lit_value in query_value
+        if lit_kind == QueryKind.NETWORK:
+            return query_value.overlaps(lit_value)
+        return False
 
-    summary = _basic_rule_summary(rule)
-    summary["source_literal_matches"] = matches_source_literals
-    summary["destination_literal_matches"] = matches_dest_literals
-    summary["source_object_matches"] = source_object_matches
-    summary["destination_object_matches"] = dest_object_matches
+    if query_kind == QueryKind.FQDN:
+        # Exact match for now; we can extend to suffix/contains later
+        return raw_value.lower() == query_value
 
-    return summary
+    # Fallback: simple substring
+    return query_value in raw_value
 
 
-def _search_rules_in_policy(
-    policy_id: str,
-    indicator: str,
-    domain_uuid: Optional[str],
+def collect_matching_literals(
+    query_kind: str, query_value: Any, network_block: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Collect literals in a network block (source/destination) that match the query.
+    """
+    if not network_block:
+        return []
+
+    matches: List[Dict[str, Any]] = []
+    for lit in network_block.get("literals") or []:
+        if literal_matches(query_kind, query_value, lit):
+            matches.append(lit)
+    return matches
+
+
+# --------------------------------------------------------------------------------------
+# Network object index for rule/object matching
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class AddressInterval:
+    version: int  # 4 or 6
+    start: int
+    end: int
+
+
+@dataclass
+class NetworkObject:
+    id: str
+    name: str
+    type: str  # Host, Network, Range, FQDN, NetworkGroup, DynamicObject, etc.
+    intervals: List[AddressInterval] = field(default_factory=list)
+    fqdns: List[str] = field(default_factory=list)
+    member_ids: List[str] = field(default_factory=list)  # for groups/dynamic
+
+
+class NetworkObjectIndex:
+    """
+    Index of FMC network-related objects with matching helpers.
+
+    - Hosts → single IP
+    - Networks → CIDR (interval)
+    - Ranges → start-end interval
+    - FQDN objects → fqdn strings
+    - NetworkGroups → can have objects + literals
+    - DynamicObjects → treated similarly (if FMC exposes literals)
+    """
+
+    def __init__(self) -> None:
+        self.by_id: Dict[str, NetworkObject] = {}
+
+    # ---- Construction ---------------------------------------------------------------
+
+    @staticmethod
+    def _ip_to_interval(ip: ipaddress._BaseAddress) -> AddressInterval:
+        return AddressInterval(version=ip.version, start=int(ip), end=int(ip))
+
+    @staticmethod
+    def _network_to_interval(net: ipaddress._BaseNetwork) -> AddressInterval:
+        return AddressInterval(
+            version=net.version,
+            start=int(net.network_address),
+            end=int(net.broadcast_address),
+        )
+
+    @staticmethod
+    def _range_to_interval(
+        start_ip: ipaddress._BaseAddress, end_ip: ipaddress._BaseAddress
+    ) -> AddressInterval:
+        if start_ip.version != end_ip.version:
+            # Safety: do not mix v4/v6
+            raise ValueError("IP range has mixed versions")
+        s = int(start_ip)
+        e = int(end_ip)
+        if e < s:
+            raise ValueError("IP range end < start")
+        return AddressInterval(version=start_ip.version, start=s, end=e)
+
+    def add_host(self, obj: Dict[str, Any]) -> None:
+        obj_id = obj.get("id")
+        name = obj.get("name") or obj_id
+        ip_str = obj.get("value")
+        if not obj_id or not ip_str:
+            return
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            logger.debug("Skipping invalid host object %s=%s", obj_id, ip_str)
+            return
+
+        self.by_id[obj_id] = NetworkObject(
+            id=obj_id,
+            name=name,
+            type="Host",
+            intervals=[self._ip_to_interval(ip)],
+        )
+
+    def add_network(self, obj: Dict[str, Any]) -> None:
+        obj_id = obj.get("id")
+        name = obj.get("name") or obj_id
+        value = obj.get("value")
+        if not obj_id or not value:
+            return
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            logger.debug("Skipping invalid network object %s=%s", obj_id, value)
+            return
+
+        self.by_id[obj_id] = NetworkObject(
+            id=obj_id,
+            name=name,
+            type="Network",
+            intervals=[self._network_to_interval(net)],
+        )
+
+    def add_range(self, obj: Dict[str, Any]) -> None:
+        obj_id = obj.get("id")
+        name = obj.get("name") or obj_id
+        start_ip_str = obj.get("startIpAddress")
+        end_ip_str = obj.get("endIpAddress")
+        if not obj_id or not start_ip_str or not end_ip_str:
+            return
+        try:
+            start_ip = ipaddress.ip_address(start_ip_str)
+            end_ip = ipaddress.ip_address(end_ip_str)
+            interval = self._range_to_interval(start_ip, end_ip)
+        except ValueError:
+            logger.debug(
+                "Skipping invalid range object %s=%s-%s",
+                obj_id,
+                start_ip_str,
+                end_ip_str,
+            )
+            return
+
+        self.by_id[obj_id] = NetworkObject(
+            id=obj_id,
+            name=name,
+            type="Range",
+            intervals=[interval],
+        )
+
+    def add_fqdn(self, obj: Dict[str, Any]) -> None:
+        obj_id = obj.get("id")
+        name = obj.get("name") or obj_id
+        value = obj.get("value")
+        if not obj_id or not value:
+            return
+
+        fqdn = str(value).lower()
+        self.by_id[obj_id] = NetworkObject(
+            id=obj_id,
+            name=name,
+            type="FQDN",
+            fqdns=[fqdn],
+        )
+
+    def _add_literals_to_object(
+        self, netobj: NetworkObject, literals: List[Dict[str, Any]]
+    ) -> None:
+        """
+        For network groups / dynamic objects we may have literals inside the object.
+        """
+        for lit in literals:
+            v = lit.get("value")
+            if not v:
+                continue
+            lit_kind, lit_value = parse_literal_value(str(v))
+            if lit_kind == QueryKind.IP:
+                try:
+                    ip = ipaddress.ip_address(str(lit_value))
+                    netobj.intervals.append(self._ip_to_interval(ip))
+                except ValueError:
+                    continue
+            elif lit_kind == QueryKind.NETWORK:
+                try:
+                    net = ipaddress.ip_network(str(lit_value), strict=False)
+                    netobj.intervals.append(self._network_to_interval(net))
+                except ValueError:
+                    continue
+            elif lit_kind == QueryKind.FQDN:
+                netobj.fqdns.append(str(lit_value).lower())
+
+    def add_network_group(self, obj: Dict[str, Any]) -> None:
+        obj_id = obj.get("id")
+        name = obj.get("name") or obj_id
+        if not obj_id:
+            return
+
+        netobj = NetworkObject(
+            id=obj_id,
+            name=name,
+            type="NetworkGroup",
+            intervals=[],
+            fqdns=[],
+            member_ids=[],
+        )
+
+        # child objects (other network/host/range/fqdn/group/dynamic)
+        for child in obj.get("objects") or []:
+            child_id = child.get("id")
+            if child_id:
+                netobj.member_ids.append(child_id)
+
+        # literals (IPs, networks, FQDNs)
+        self._add_literals_to_object(netobj, obj.get("literals") or [])
+
+        self.by_id[obj_id] = netobj
+
+    def add_dynamic_object(self, obj: Dict[str, Any]) -> None:
+        obj_id = obj.get("id")
+        name = obj.get("name") or obj_id
+        if not obj_id:
+            return
+
+        netobj = NetworkObject(
+            id=obj_id,
+            name=name,
+            type="DynamicObject",
+            intervals=[],
+            fqdns=[],
+            member_ids=[],
+        )
+
+        # nested objects
+        for child in obj.get("objects") or []:
+            child_id = child.get("id")
+            if child_id:
+                netobj.member_ids.append(child_id)
+
+        # nested literals (where present)
+        self._add_literals_to_object(netobj, obj.get("literals") or [])
+
+        self.by_id[obj_id] = netobj
+
+    # ---- Matching helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _intervals_overlap(a: AddressInterval, b: AddressInterval) -> bool:
+        if a.version != b.version:
+            return False
+        return not (a.end < b.start or b.end < a.start)
+
+    def _build_query_intervals(
+        self, query_kind: str, query_value: Any
+    ) -> List[AddressInterval]:
+        """
+        Convert query IP / network to intervals (for comparision with ranges / nets).
+        """
+        if query_kind == QueryKind.IP:
+            return [self._ip_to_interval(query_value)]
+        if query_kind == QueryKind.NETWORK:
+            return [self._network_to_interval(query_value)]
+        return []
+
+    def _object_matches(
+        self,
+        netobj: NetworkObject,
+        query_kind: str,
+        query_value: Any,
+        query_intervals: List[AddressInterval],
+        *,
+        visited: Optional[Set[str]] = None,
+    ) -> bool:
+        """
+        Does this object (or its members, for groups/dynamic) match the query?
+        """
+        if visited is None:
+            visited = set()
+        if netobj.id in visited:
+            return False
+        visited.add(netobj.id)
+
+        # 1) Direct IP / network / range intervals
+        if query_kind in {QueryKind.IP, QueryKind.NETWORK} and query_intervals:
+            for obj_interval in netobj.intervals:
+                for q_interval in query_intervals:
+                    if self._intervals_overlap(obj_interval, q_interval):
+                        return True
+
+        # 2) FQDN direct list
+        if query_kind == QueryKind.FQDN and netobj.fqdns:
+            if query_value in netobj.fqdns:
+                return True
+
+        # 3) Nested members for NetworkGroups / DynamicObjects
+        if netobj.member_ids:
+            for member_id in netobj.member_ids:
+                child = self.by_id.get(member_id)
+                if child and self._object_matches(
+                    child,
+                    query_kind,
+                    query_value,
+                    query_intervals,
+                    visited=visited,
+                ):
+                    return True
+
+        return False
+
+    def match_objects(
+        self, query_kind: str, query_value: Any
+    ) -> List[NetworkObject]:
+        """
+        Return all objects that match query.
+        """
+        results: List[NetworkObject] = []
+        query_intervals = self._build_query_intervals(query_kind, query_value)
+
+        for obj in self.by_id.values():
+            try:
+                if self._object_matches(
+                    obj, query_kind, query_value, query_intervals
+                ):
+                    results.append(obj)
+            except Exception as exc:
+                logger.debug("Error matching object %s: %s", obj.id, exc)
+
+        return results
+
+
+# --------------------------------------------------------------------------------------
+# Shared search helper (single policy)
+# --------------------------------------------------------------------------------------
+
+
+async def _search_rules_for_query(
     client: FMCClient,
+    query: str,
+    access_policy_id: str,
 ) -> Dict[str, Any]:
     """
-    Core function to:
-      1. Build the network object index once.
-      2. Fetch and scan Access Rules in the given policy.
-    """
+    Core logic shared by find_rules_by_ip_or_fqdn and find_rules_for_target:
 
-    index = NetworkObjectIndex.build_from_fmc(client, domain_uuid=domain_uuid)
-    rules = client.list_access_rules_for_policy(policy_id, domain_uuid=domain_uuid)
+      - validate/query classify (IP, subnet, FQDN)
+      - build object index
+      - find matching objects
+      - fetch rules (expanded=true)
+      - find literal & object matches
+
+    Returns a dict (not JSON string).
+    """
+    resolved_domain = await client.ensure_domain_uuid()
+    settings = client.settings
+
+    # Use stricter indicator validation here as well
+    try:
+        query_kind, query_value = classify_indicator(query, "auto")
+    except InvalidIndicatorError as ind_err:
+        raise FMCClientError(f"Invalid query indicator: {ind_err}") from ind_err
+
+    # 1) Build network object index
+    obj_index = NetworkObjectIndex()
+
+    logger.info("Loading FMC network objects for matching...")
+
+    hosts = await client.list_host_objects()
+    for obj in hosts:
+        obj_index.add_host(obj)
+
+    networks = await client.list_network_objects()
+    for obj in networks:
+        obj_index.add_network(obj)
+
+    ranges = await client.list_range_objects()
+    for obj in ranges:
+        obj_index.add_range(obj)
+
+    fqdns = await client.list_fqdn_objects()
+    for obj in fqdns:
+        obj_index.add_fqdn(obj)
+
+    groups = await client.list_network_groups()
+    for obj in groups:
+        obj_index.add_network_group(obj)
+
+    dynamics = await client.list_dynamic_objects()
+    for obj in dynamics:
+        obj_index.add_dynamic_object(obj)
+
+    logger.info(
+        "Indexed %s network objects (hosts=%s networks=%s ranges=%s fqdns=%s groups=%s dynamics=%s)",
+        len(obj_index.by_id),
+        len(hosts),
+        len(networks),
+        len(ranges),
+        len(fqdns),
+        len(groups),
+        len(dynamics),
+    )
+
+    # Find all matching objects for the query
+    matching_objects = obj_index.match_objects(query_kind, query_value)
+    logger.info("Found %s matching network/FQDN objects", len(matching_objects))
+
+    # Map object id -> summary for quick lookup
+    matched_object_ids: Dict[str, Dict[str, Any]] = {}
+    for netobj in matching_objects:
+        matched_object_ids[netobj.id] = {
+            "id": netobj.id,
+            "name": netobj.name,
+            "type": netobj.type,
+            "fqdns": netobj.fqdns,
+            "has_intervals": bool(netobj.intervals),
+            "members": netobj.member_ids,
+        }
+
+    # 2) Fetch expanded access rules for the policy
+    logger.info("Fetching Access Control rules for policy %s", access_policy_id)
+    rules = await client.list_access_rules(access_policy_id, expanded=True)
+
+    logger.info("Loaded %s rules from policy %s", len(rules), access_policy_id)
 
     matched_rules: List[Dict[str, Any]] = []
+
     for rule in rules:
-        matched = _match_rule_against_indicator(rule, indicator, index)
-        if matched:
-            matched_rules.append(matched)
+        src_block = (rule.get("sourceNetworks") or {}).copy()
+        dst_block = (rule.get("destinationNetworks") or {}).copy()
 
-    indicator_matches = index.find_matches_for_indicator(indicator)
+        # Literal IP / network matching
+        src_lit_matches = collect_matching_literals(
+            query_kind, query_value, src_block
+        )
+        dst_lit_matches = collect_matching_literals(
+            query_kind, query_value, dst_block
+        )
 
-    return {
-        "fmc_base_url": client.base_url,
-        "domain_uuid": client.get_effective_domain_uuid(domain_uuid),
-        "access_policy_id": policy_id,
-        "query": indicator,
-        "query_kind": indicator_matches["indicator_type"],
-        "matched_object_count": sum(
-            len(indicator_matches[k])
-            for k in [
-                "matched_hosts",
-                "matched_networks",
-                "matched_ranges",
-                "matched_fqdns",
-                "matched_groups",
-                "matched_dynamic_objects",
-            ]
-        ),
-        "object_match_summary": indicator_matches,
+        # Object matches (by id)
+        src_object_matches: List[Dict[str, Any]] = []
+        dst_object_matches: List[Dict[str, Any]] = []
+
+        for ref in src_block.get("objects") or []:
+            obj_id = ref.get("id")
+            if not obj_id:
+                continue
+            match = matched_object_ids.get(obj_id)
+            if match:
+                enriched = {
+                    "id": obj_id,
+                    "name": ref.get("name") or match.get("name"),
+                    "type": ref.get("type") or match.get("type"),
+                }
+                src_object_matches.append(enriched)
+
+        for ref in dst_block.get("objects") or []:
+            obj_id = ref.get("id")
+            if not obj_id:
+                continue
+            match = matched_object_ids.get(obj_id)
+            if match:
+                enriched = {
+                    "id": obj_id,
+                    "name": ref.get("name") or match.get("name"),
+                    "type": ref.get("type") or match.get("type"),
+                }
+                dst_object_matches.append(enriched)
+
+        if not (
+            src_lit_matches
+            or dst_lit_matches
+            or src_object_matches
+            or dst_object_matches
+        ):
+            continue  # no match at all
+
+        matched_rules.append(
+            {
+                "id": rule.get("id"),
+                "name": rule.get("name"),
+                "section": rule.get("metadata", {}).get("section"),
+                "action": rule.get("action"),
+                "enabled": rule.get("enabled", True),
+                "hit_count": rule.get("metadata", {}).get("ruleHitCount"),
+                "metadata": {
+                    "ruleIndex": rule.get("metadata", {}).get("ruleIndex"),
+                    "section": rule.get("metadata", {}).get("section"),
+                },
+                "source_literal_matches": src_lit_matches,
+                "destination_literal_matches": dst_lit_matches,
+                "source_object_matches": src_object_matches,
+                "destination_object_matches": dst_object_matches,
+            }
+        )
+
+    result: Dict[str, Any] = {
+        "fmc_base_url": settings.base_url,
+        "domain_uuid": resolved_domain,
+        "access_policy_id": access_policy_id,
+        "query": query,
+        "query_kind": query_kind,
+        "matched_object_count": len(matching_objects),
+        "object_match_summary": matching_objects,
         "matched_rule_count": len(matched_rules),
         "matched_rules": matched_rules,
     }
+    return result
 
 
-# -----------------------------------------------------------------------------
-# High-level FMC-driven search across Access Policies
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# MCP server + tools
+# --------------------------------------------------------------------------------------
 
-def _validate_indicator_type(indicator: str, indicator_type: str) -> Tuple[bool, Optional[str]]:
-    """
-    Validate indicator against explicit indicator_type.
-    """
-    try:
-        if indicator_type == "ip":
-            ipaddress.ip_address(indicator)
-            return True, None
-        if indicator_type == "subnet":
-            ipaddress.ip_network(indicator, strict=False)
-            return True, None
-        if indicator_type == "fqdn":
-            # Very loose check: must contain at least one dot and not be numeric-only
-            s = indicator.strip()
-            if "." not in s or s.replace(".", "").isdigit():
-                return False, "Value does not look like an FQDN"
-            return True, None
-        if indicator_type == "auto":
-            return True, None
-    except ValueError as e:
-        return False, f"Invalid {indicator_type}: {e}"
-    return False, f"Unsupported indicator_type: {indicator_type}"
-
-
-def _normalize_indicator_auto(indicator: str) -> Tuple[str, str, Optional[str]]:
-    """
-    When indicator_type="auto", try to classify IP, subnet, or FQDN.
-    """
-    # IP?
-    try:
-        ipaddress.ip_address(indicator)
-        return indicator, "ip", None
-    except ValueError:
-        pass
-
-    # CIDR?
-    try:
-        ipaddress.ip_network(indicator, strict=False)
-        return indicator, "subnet", None
-    except ValueError:
-        pass
-
-    # FQDN fallback
-    s = indicator.strip()
-    if "." in s and not s.replace(".", "").isdigit():
-        return s, "fqdn", None
-
-    return indicator, "fqdn", "Could not classify indicator cleanly; treating as FQDN"
-
-
-def _search_access_policies_for_indicator(
-    client: FMCClient,
-    indicator: str,
-    indicator_type: str,
-    scope: str,
-    policy_name: Optional[str],
-    max_results: int,
-    domain_uuid: Optional[str],
-) -> Dict[str, Any]:
-    """
-    FMC-centric search: list Access Policies, build index once per query,
-    and scan rules across policies.
-    """
-
-    # 1) Validate / normalise indicator
-    if indicator_type == "auto":
-        indicator, indicator_type, warn = _normalize_indicator_auto(indicator)
-        if warn:
-            logger.info("Indicator auto-classification warning: %s", warn)
-    else:
-        ok, err = _validate_indicator_type(indicator, indicator_type)
-        if not ok:
-            return {"error": {"category": "VALIDATION", "message": err}}
-
-    # 2) Fetch policies based on scope
-    all_policies = client.list_access_policies(domain_uuid=domain_uuid)
-    if scope == "policy":
-        if not policy_name:
-            return {
-                "error": {
-                    "category": "VALIDATION",
-                    "message": "scope='policy' requires 'policy_name'",
-                }
-            }
-        # Match by name (case-sensitive for now)
-        policies = [p for p in all_policies if p.get("name") == policy_name]
-        if not policies:
-            return {
-                "error": {
-                    "category": "NOT_FOUND",
-                    "message": f"No Access Policy named '{policy_name}' found.",
-                }
-            }
-    else:
-        # scope = "fmc"
-        policies = all_policies
-
-    # 3) Build index once
-    index = NetworkObjectIndex.build_from_fmc(client, domain_uuid=domain_uuid)
-
-    # 4) Scan rules in each policy, stop when max_results reached
-    matched_rules: List[Dict[str, Any]] = []
-    policies_scanned: List[Dict[str, Any]] = []
-    truncated = False
-
-    for p in policies:
-        if len(matched_rules) >= max_results:
-            truncated = True
-            break
-
-        pid = p.get("id")
-        pname = p.get("name")
-        if not pid:
-            continue
-
-        policies_scanned.append({"id": pid, "name": pname})
-        rules = client.list_access_rules_for_policy(pid, domain_uuid=domain_uuid)
-
-        for rule in rules:
-            if len(matched_rules) >= max_results:
-                truncated = True
-                break
-            matched = _match_rule_against_indicator(rule, indicator, index)
-            if matched:
-                matched_rules.append(matched)
-
-    indicator_matches = index.find_matches_for_indicator(indicator)
-
-    return {
-        "meta": {
-            "fmc": {
-                "base_url": client.base_url,
-                "domain_uuid": client.get_effective_domain_uuid(domain_uuid),
-            },
-            "indicator": indicator,
-            "indicator_type": indicator_type,
-            "matched_object_count": sum(
-                len(indicator_matches[k])
-                for k in [
-                    "matched_hosts",
-                    "matched_networks",
-                    "matched_ranges",
-                    "matched_fqdns",
-                    "matched_groups",
-                    "matched_dynamic_objects",
-                ]
-            ),
-            "matched_rules_count": len(matched_rules),
-            "policies_scanned": len(policies_scanned),
-            "scope": scope,
-            "truncated": truncated,
-        },
-        "items": matched_rules,
-        "objects": indicator_matches,
-        "policies_scanned": policies_scanned,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Device / target resolution helper
-# -----------------------------------------------------------------------------
-
-def _resolve_target_to_policy(
-    client: FMCClient,
-    target: str,
-    domain_uuid: Optional[str],
-) -> Dict[str, Any]:
-    """
-    Resolve a target name to its Access Policy.
-
-    Target can match:
-      - Device name
-      - Device hostName
-      - HA pair name
-      - Cluster name
-    """
-    devices = client.list_devices(domain_uuid=domain_uuid)
-    ha_pairs = client.list_device_ha_pairs(domain_uuid=domain_uuid)
-    clusters = client.list_device_clusters(domain_uuid=domain_uuid)
-
-    # 1) Direct device match
-    for d in devices:
-        if d.get("name") == target or d.get("hostName") == target:
-            acp = d.get("accessPolicy")
-            return {
-                "target_type": "DEVICE",
-                "target_id": d.get("id"),
-                "target_name": d.get("name"),
-                "access_policy": acp,
-            }
-
-    # 2) HA pair match
-    for ha in ha_pairs:
-        if ha.get("name") == target:
-            # Usually there is a 'primary' device id that has the ACP
-            members = ha.get("devices", [])
-            acp = None
-            dev_id = None
-            for m in members:
-                dev_id = m.get("id")
-                if dev_id:
-                    detail = client.get_device(dev_id, domain_uuid=domain_uuid)
-                    acp = detail.get("accessPolicy")
-                    if acp:
-                        break
-            return {
-                "target_type": "HA",
-                "target_id": ha.get("id"),
-                "target_name": ha.get("name"),
-                "access_policy": acp,
-            }
-
-    # 3) Cluster match
-    for cl in clusters:
-        if cl.get("name") == target:
-            members = cl.get("devices", [])
-            acp = None
-            dev_id = None
-            for m in members:
-                dev_id = m.get("id")
-                if dev_id:
-                    detail = client.get_device(dev_id, domain_uuid=domain_uuid)
-                    acp = detail.get("accessPolicy")
-                    if acp:
-                        break
-            return {
-                "target_type": "CLUSTER",
-                "target_id": cl.get("id"),
-                "target_name": cl.get("name"),
-                "access_policy": acp,
-            }
-
-    return {
-        "target_type": "UNKNOWN",
-        "target_id": None,
-        "target_name": target,
-        "access_policy": None,
-    }
-
-
-# -----------------------------------------------------------------------------
-# FastMCP server & tools
-# -----------------------------------------------------------------------------
-
-mcp = FastMCP("cisco-secure-firewall-mcp")
+mcp = FastMCP("cisco-secure-firewall-fmc")  # MCP server name
 
 
 @mcp.tool()
-def find_rules_by_ip_or_fqdn(
+async def find_rules_by_ip_or_fqdn(
     query: str,
     access_policy_id: str,
     domain_uuid: Optional[str] = None,
@@ -1375,7 +1276,7 @@ def find_rules_by_ip_or_fqdn(
          - matched FMC network/FQDN objects
          - rules that reference them (or literals matching the query)
 
-    Args:
+    Parameters:
         query:
             - Single IP address, e.g. "10.10.10.5"
             - CIDR network, e.g. "10.10.10.0/24"
@@ -1424,45 +1325,39 @@ def find_rules_by_ip_or_fqdn(
               }
             }
     """
-    logger.info(
-        "Tool find_rules_by_ip_or_fqdn called: query=%s, policy=%s, domain=%s",
-        query,
-        access_policy_id,
-        domain_uuid,
-    )
-
     try:
-        result = _search_rules_in_policy(
-            access_policy_id,
-            query,
-            domain_uuid,
-            fmc_client,
-        )
-        return json.dumps(result)
-    except FMCClientError as e:
-        logger.exception("FMC client error in find_rules_by_ip_or_fqdn")
-        return json.dumps(
-            {
-                "error": {
-                    "category": "FMC_CLIENT",
-                    "message": str(e),
-                }
+        settings = FMCSettings.from_env()
+        if domain_uuid:
+            settings.domain_uuid = domain_uuid
+
+        client = FMCClient(settings)
+
+        result = await _search_rules_for_query(client, query, access_policy_id)
+        return json.dumps(result, indent=2)
+
+    except FMCClientError as fmc_err:
+        logger.error("FMCClientError in find_rules_by_ip_or_fqdn: %s", fmc_err)
+        error_payload = {
+            "error": {
+                "category": "FMC_CLIENT",
+                "message": str(fmc_err),
             }
-        )
-    except Exception as e:  # noqa: BLE001
+        }
+        return json.dumps(error_payload, indent=2)
+
+    except Exception as exc:
         logger.exception("Unexpected error in find_rules_by_ip_or_fqdn")
-        return json.dumps(
-            {
-                "error": {
-                    "category": "UNEXPECTED",
-                    "message": str(e),
-                }
+        error_payload = {
+            "error": {
+                "category": "UNEXPECTED",
+                "message": str(exc),
             }
-        )
+        }
+        return json.dumps(error_payload, indent=2)
 
 
 @mcp.tool()
-def find_rules_for_target(
+async def find_rules_for_target(
     query: str,
     target: str,
     domain_uuid: Optional[str] = None,
@@ -1490,76 +1385,245 @@ def find_rules_for_target(
     Returns:
         JSON string with rule matches and resolution details, or an "error" object.
     """
-    logger.info(
-        "Tool find_rules_for_target called: query=%s, target=%s, domain=%s",
-        query,
-        target,
-        domain_uuid,
-    )
     try:
-        resolution = _resolve_target_to_policy(
-            fmc_client,
-            target,
-            domain_uuid,
-        )
-        acp = resolution.get("access_policy")
-        if not acp or not acp.get("id"):
+        settings = FMCSettings.from_env()
+        if domain_uuid:
+            settings.domain_uuid = domain_uuid
+
+        client = FMCClient(settings)
+        resolved_domain = await client.ensure_domain_uuid()
+
+        # 1) Collect devices + HA pairs + clusters
+        devices = await client.list_device_records()
+        ha_pairs = await client.list_device_ha_pairs()
+        clusters = await client.list_device_clusters()
+
+        if not (devices or ha_pairs or clusters):
             return json.dumps(
                 {
-                    "resolution": resolution,
                     "error": {
-                        "category": "NOT_FOUND",
-                        "message": "No Access Policy associated with target.",
-                    },
-                }
+                        "category": "FMC_CLIENT",
+                        "message": (
+                            "No device records, HA pairs, or clusters found in FMC."
+                        ),
+                    }
+                },
+                indent=2,
             )
 
-        policy_id = acp["id"]
-        search_result = _search_rules_in_policy(
-            policy_id,
-            query,
-            domain_uuid,
-            fmc_client,
-        )
-        return json.dumps(
-            {
-                "resolution": resolution,
-                "search_result": search_result,
+        # Wrap them with a 'kind' field so we know what we matched
+        candidates: List[Dict[str, Any]] = []
+
+        for dev in devices:
+            candidates.append({"kind": "device", "record": dev})
+
+        for ha in ha_pairs:
+            candidates.append({"kind": "ha", "record": ha})
+
+        for cl in clusters:
+            candidates.append({"kind": "cluster", "record": cl})
+
+        norm_target = target.strip().lower()
+        exact_matches: List[Dict[str, Any]] = []
+        partial_matches: List[Dict[str, Any]] = []
+
+        for cand in candidates:
+            record = cand["record"]
+            name = (record.get("name") or "").strip()
+            host_name = (record.get("hostName") or "").strip()
+
+            name_lower = name.lower()
+            host_lower = host_name.lower()
+
+            if norm_target == name_lower or (host_lower and norm_target == host_lower):
+                exact_matches.append(cand)
+            elif norm_target in name_lower or (
+                host_lower and norm_target in host_lower
+            ):
+                partial_matches.append(cand)
+
+        if not exact_matches and not partial_matches:
+            return json.dumps(
+                {
+                    "error": {
+                        "category": "RESOLUTION",
+                        "message": (
+                            f"No device/HA/cluster record matched target '{target}'."
+                        ),
+                    }
+                },
+                indent=2,
+            )
+
+        # Prefer exact matches; fall back to partial
+        chosen = None
+        origin_kind = ""
+        resolution_note = ""
+
+        if exact_matches:
+            chosen = exact_matches[0]
+            kinds = {c["kind"] for c in exact_matches}
+            if len(exact_matches) > 1 or len(kinds) > 1:
+                resolution_note = (
+                    f"Multiple exact matches for '{target}' "
+                    f"(kinds={sorted(kinds)}), picked the first."
+                )
+            else:
+                resolution_note = "Exact match by name/hostName."
+        elif partial_matches:
+            chosen = partial_matches[0]
+            kinds = {c["kind"] for c in partial_matches}
+            if len(partial_matches) > 1 or len(kinds) > 1:
+                resolution_note = (
+                    f"Multiple partial matches for '{target}' "
+                    f"(kinds={sorted(kinds)}), picked the first."
+                )
+            else:
+                resolution_note = "Partial match by name/hostName."
+        else:
+            return json.dumps(
+                {
+                    "error": {
+                        "category": "RESOLUTION",
+                        "message": (
+                            f"No device/HA/cluster record matched target '{target}'."
+                        ),
+                    }
+                },
+                indent=2,
+            )
+
+        origin_kind = chosen["kind"]
+        record = chosen["record"]
+        device_id = record.get("id")
+        device_name = record.get("name")
+        device_host = record.get("hostName")
+
+        if not device_id:
+            return json.dumps(
+                {
+                    "error": {
+                        "category": "RESOLUTION",
+                        "message": (
+                            f"Chosen record for target '{target}' has no id; "
+                            "cannot resolve policy."
+                        ),
+                    }
+                },
+                indent=2,
+            )
+
+        # 2) Try to resolve Access Policy:
+        # First, look for an inline "accessPolicy" reference
+        policy = (record.get("accessPolicy") or {}).copy()
+
+        # Some FMC objects (especially HA pairs / clusters) don't carry
+        # the AccessPolicy inline; they are only visible via
+        # /assignment/policyassignments. If we didn't find an AccessPolicy
+        # on the record, or the type is not AccessPolicy, look it up there.
+        if not policy or policy.get("type") != "AccessPolicy":
+            assignments = await client.list_policy_assignments()
+            target_id = device_id
+
+            access_assignments: List[Dict[str, Any]] = []
+            for assign in assignments:
+                pol = assign.get("policy") or {}
+                if pol.get("type") != "AccessPolicy":
+                    continue
+                for t in assign.get("targets") or []:
+                    if t.get("id") == target_id:
+                        access_assignments.append(assign)
+
+            if not access_assignments:
+                return json.dumps(
+                    {
+                        "error": {
+                            "category": "RESOLUTION",
+                            "message": (
+                                f"No Access Policy assignment found for target '{target}'."
+                            ),
+                        }
+                    },
+                    indent=2,
+                )
+
+            if len(access_assignments) > 1:
+                logger.warning(
+                    "Multiple AccessPolicy assignments found for %s, using first",
+                    target,
+                )
+
+            chosen_assign = access_assignments[0]
+            policy = chosen_assign.get("policy") or {}
+
+        if not policy or policy.get("type") != "AccessPolicy":
+            return json.dumps(
+                {
+                    "error": {
+                        "category": "RESOLUTION",
+                        "message": (
+                            f"Could not resolve Access Policy for target '{target}'."
+                        ),
+                    }
+                },
+                indent=2,
+            )
+
+        access_policy_id = policy.get("id")
+        access_policy_name = policy.get("name")
+
+        # 3) Reuse the core search logic
+        result_core = await _search_rules_for_query(client, query, access_policy_id)
+
+        # 4) Augment with target / device info
+        result_core["target"] = target
+        result_core["resolved_device"] = {
+            "kind": origin_kind,
+            "id": device_id,
+            "name": device_name,
+            "hostName": device_host,
+            "access_policy": {
+                "id": access_policy_id,
+                "name": access_policy_name,
+                "type": policy.get("type"),
+            },
+        }
+        result_core["resolution_note"] = resolution_note
+        result_core["domain_uuid"] = resolved_domain  # ensure visible
+
+        return json.dumps(result_core, indent=2)
+
+    except FMCClientError as fmc_err:
+        logger.error("FMCClientError in find_rules_for_target: %s", fmc_err)
+        error_payload = {
+            "error": {
+                "category": "FMC_CLIENT",
+                "message": str(fmc_err),
             }
-        )
-    except FMCClientError as e:
-        logger.exception("FMC client error in find_rules_for_target")
-        return json.dumps(
-            {
-                "error": {
-                    "category": "FMC_CLIENT",
-                    "message": str(e),
-                }
-            }
-        )
-    except Exception as e:  # noqa: BLE001
+        }
+        return json.dumps(error_payload, indent=2)
+
+    except Exception as exc:
         logger.exception("Unexpected error in find_rules_for_target")
-        return json.dumps(
-            {
-                "error": {
-                    "category": "UNEXPECTED",
-                    "message": str(e),
-                }
+        error_payload = {
+            "error": {
+                "category": "UNEXPECTED",
+                "message": str(exc),
             }
-        )
+        }
+        return json.dumps(error_payload, indent=2)
 
 
 @mcp.tool()
-def search_access_rules(
+async def search_access_rules(
     indicator: str,
-    indicator_type: str = "auto",
-    scope: str = "fmc",
+    indicator_type: Literal["auto", "ip", "subnet", "fqdn"] = "auto",
+    scope: Literal["policy", "fmc"] = "fmc",
     policy_name: Optional[str] = None,
     max_results: int = 100,
     domain_uuid: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    FMC-driven rule search for an IP/CIDR/FQDN across Access Policies.
+    """FMC-driven rule search for an IP/CIDR/FQDN across Access Policies.
 
     This tool is FMC-centric and does *not* require an FTD/cluster name. It will:
 
@@ -1597,83 +1661,343 @@ def search_access_rules(
         A JSON-serialisable dict with ``meta`` and ``items`` keys, or an
         ``error`` object if validation or FMC access fails.
     """
-    logger.info(
-        "Tool search_access_rules called: indicator=%s, indicator_type=%s, "
-        "scope=%s, policy_name=%s, max_results=%s, domain=%s",
-        indicator,
-        indicator_type,
-        scope,
-        policy_name,
-        max_results,
-        domain_uuid,
-    )
+    # Clamp max_results to a safe range
+    if max_results < 1:
+        max_results = 1
+    elif max_results > 500:
+        max_results = 500
 
-    if max_results < 1 or max_results > 500:
+    if scope not in ("policy", "fmc"):
         return {
             "error": {
                 "category": "VALIDATION",
-                "message": "max_results must be between 1 and 500",
+                "message": f"Unsupported scope '{scope}'. Use 'policy' or 'fmc'.",
+            }
+        }
+
+    if scope == "policy" and not policy_name:
+        return {
+            "error": {
+                "category": "VALIDATION",
+                "message": "scope='policy' requires a non-empty policy_name.",
             }
         }
 
     try:
-        return _search_access_policies_for_indicator(
-            fmc_client,
-            indicator,
-            indicator_type,
-            scope,
-            policy_name,
-            max_results,
-            domain_uuid,
+        settings = FMCSettings.from_env()
+        if domain_uuid:
+            settings.domain_uuid = domain_uuid
+
+        client = FMCClient(settings)
+
+        # Validate / classify the indicator before any FMC calls
+        try:
+            kind, value = classify_indicator(indicator, indicator_type)
+        except InvalidIndicatorError as ind_err:
+            logger.info("Invalid indicator '%s': %s", indicator, ind_err)
+            return {
+                "error": {
+                    "category": "INVALID_INDICATOR",
+                    "indicator": indicator,
+                    "indicator_type": indicator_type,
+                    "message": str(ind_err),
+                }
+            }
+
+        # Determine effective indicator_type for the response
+        if kind == QueryKind.IP:
+            effective_indicator_type = "ip"
+        elif kind == QueryKind.NETWORK:
+            effective_indicator_type = "subnet"
+        else:
+            effective_indicator_type = "fqdn"
+
+        # Fetch Access Policies on this FMC/domain (with expanded=true)
+        policies = await client.list_access_policies(
+            limit=1000,
+            hard_page_limit=10,
+            expanded=True,
         )
-    except FMCClientError as e:
-        logger.exception("FMC client error in search_access_rules")
+
+        if not policies:
+            return {
+                "error": {
+                    "category": "FMC_CLIENT",
+                    "message": "No Access Policies found on FMC.",
+                }
+            }
+
+        # Filter policies if scope=policy
+        policy_filter_name = None
+        filtered_policies: List[Dict[str, Any]] = []
+
+        if scope == "policy":
+            norm_policy = policy_name.strip().lower()  # type: ignore[union-attr]
+            for pol in policies:
+                name = (pol.get("name") or "").strip()
+                if name.lower() == norm_policy:
+                    filtered_policies.append(pol)
+            if not filtered_policies:
+                available = sorted(
+                    (p.get("name") or "").strip()
+                    for p in policies
+                    if p.get("name")
+                )
+                return {
+                    "error": {
+                        "category": "RESOLUTION",
+                        "message": (
+                            f"No Access Policy named '{policy_name}' was found "
+                            "on this FMC/domain."
+                        ),
+                        "available_policies": available,
+                    }
+                }
+            policy_filter_name = policy_name
+        else:
+            filtered_policies = policies
+
+        # ------------------------------------------------------------------
+        # Build network object index ONCE for this whole search
+        # ------------------------------------------------------------------
+        query_kind = kind
+        query_value = value
+
+        logger.info("Loading FMC network objects for matching (FMC-wide search)...")
+        obj_index = NetworkObjectIndex()
+
+        hosts = await client.list_host_objects()
+        for obj in hosts:
+            obj_index.add_host(obj)
+
+        networks = await client.list_network_objects()
+        for obj in networks:
+            obj_index.add_network(obj)
+
+        ranges = await client.list_range_objects()
+        for obj in ranges:
+            obj_index.add_range(obj)
+
+        fqdns = await client.list_fqdn_objects()
+        for obj in fqdns:
+            obj_index.add_fqdn(obj)
+
+        groups = await client.list_network_groups()
+        for obj in groups:
+            obj_index.add_network_group(obj)
+
+        dynamics = await client.list_dynamic_objects()
+        for obj in dynamics:
+            obj_index.add_dynamic_object(obj)
+
+        logger.info(
+            "Indexed %s network objects for FMC search (hosts=%s networks=%s ranges=%s fqdns=%s groups=%s dynamics=%s)",
+            len(obj_index.by_id),
+            len(hosts),
+            len(networks),
+            len(ranges),
+            len(fqdns),
+            len(groups),
+            len(dynamics),
+        )
+
+        matching_objects = obj_index.match_objects(query_kind, query_value)
+        logger.info(
+            "FMC-wide search: found %s matching network/FQDN objects",
+            len(matching_objects),
+        )
+
+        matched_object_ids: Dict[str, Dict[str, Any]] = {}
+        for netobj in matching_objects:
+            matched_object_ids[netobj.id] = {
+                "id": netobj.id,
+                "name": netobj.name,
+                "type": netobj.type,
+                "fqdns": netobj.fqdns,
+                "has_intervals": bool(netobj.intervals),
+                "members": netobj.member_ids,
+            }
+
+        # ------------------------------------------------------------------
+        # For each policy, fetch rules and see which ones reference the
+        # literals or objects matching the indicator.
+        # ------------------------------------------------------------------
+        matched_items: List[Dict[str, Any]] = []
+        scanned_policies = 0
+        truncated = False
+
+        for pol in filtered_policies:
+            policy_id = pol.get("id")
+            policy_name_val = pol.get("name")
+            if not policy_id:
+                continue
+
+            scanned_policies += 1
+
+            logger.info(
+                "FMC-wide search: Fetching rules for Access Policy %s (%s)",
+                policy_name_val,
+                policy_id,
+            )
+            rules = await client.list_access_rules(policy_id, expanded=True)
+            logger.info(
+                "FMC-wide search: Loaded %s rules from policy %s",
+                len(rules),
+                policy_id,
+            )
+
+            for rule in rules:
+                src_block = (rule.get("sourceNetworks") or {}).copy()
+                dst_block = (rule.get("destinationNetworks") or {}).copy()
+
+                # Literal IP / network/FQDN matching
+                src_lit_matches = collect_matching_literals(
+                    query_kind, query_value, src_block
+                )
+                dst_lit_matches = collect_matching_literals(
+                    query_kind, query_value, dst_block
+                )
+
+                # Object matches (by id) using the pre-built matched_object_ids
+                src_object_matches: List[Dict[str, Any]] = []
+                dst_object_matches: List[Dict[str, Any]] = []
+
+                for ref in src_block.get("objects") or []:
+                    obj_id = ref.get("id")
+                    if not obj_id:
+                        continue
+                    match = matched_object_ids.get(obj_id)
+                    if match:
+                        enriched = {
+                            "id": obj_id,
+                            "name": ref.get("name") or match.get("name"),
+                            "type": ref.get("type") or match.get("type"),
+                        }
+                        src_object_matches.append(enriched)
+
+                for ref in dst_block.get("objects") or []:
+                    obj_id = ref.get("id")
+                    if not obj_id:
+                        continue
+                    match = matched_object_ids.get(obj_id)
+                    if match:
+                        enriched = {
+                            "id": obj_id,
+                            "name": ref.get("name") or match.get("name"),
+                            "type": ref.get("type") or match.get("type"),
+                        }
+                        dst_object_matches.append(enriched)
+
+                if not (
+                    src_lit_matches
+                    or dst_lit_matches
+                    or src_object_matches
+                    or dst_object_matches
+                ):
+                    continue
+
+                rule_entry = {
+                    "id": rule.get("id"),
+                    "name": rule.get("name"),
+                    "section": rule.get("metadata", {}).get("section"),
+                    "action": rule.get("action"),
+                    "enabled": rule.get("enabled", True),
+                    "hit_count": rule.get("metadata", {}).get("ruleHitCount"),
+                    "metadata": {
+                        "ruleIndex": rule.get("metadata", {}).get("ruleIndex"),
+                        "section": rule.get("metadata", {}).get("section"),
+                    },
+                    "source_literal_matches": src_lit_matches,
+                    "destination_literal_matches": dst_lit_matches,
+                    "source_object_matches": src_object_matches,
+                    "destination_object_matches": dst_object_matches,
+                }
+
+                matched_items.append(
+                    {
+                        "policy": {
+                            "id": policy_id,
+                            "name": policy_name_val,
+                        },
+                        "rule": rule_entry,
+                    }
+                )
+
+                if len(matched_items) >= max_results:
+                    truncated = True
+                    break
+
+            if len(matched_items) >= max_results:
+                break
+
+        resolved_domain = await client.ensure_domain_uuid()
+
+        meta: Dict[str, Any] = {
+            "indicator": indicator,
+            "indicator_type": effective_indicator_type,
+            "scope": scope,
+            "fmc": {
+                "base_url": settings.base_url,
+                "domain_uuid": resolved_domain,
+            },
+            "policies_scanned": scanned_policies,
+            "matched_rules_count": len(matched_items),
+            "matched_object_count": len(matching_objects),
+            "truncated": truncated,
+        }
+        if policy_filter_name:
+            meta["policy_filter"] = policy_filter_name
+
+        return {
+            "meta": meta,
+            "items": matched_items,
+        }
+
+    except FMCClientError as fmc_err:
+        logger.error("FMCClientError in search_access_rules: %s", fmc_err)
         return {
             "error": {
                 "category": "FMC_CLIENT",
-                "message": str(e),
+                "message": str(fmc_err),
             }
         }
-    except Exception as e:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("Unexpected error in search_access_rules")
         return {
             "error": {
                 "category": "UNEXPECTED",
-                "message": str(e),
+                "message": str(exc),
             }
         }
 
 
-# -----------------------------------------------------------------------------
-# Main entrypoint
-# -----------------------------------------------------------------------------
 def main() -> None:
-    """Entry point for running the MCP server.
-
-    By default this runs the HTTP transport for use in Docker / remote agents.
-    Set MCP_TRANSPORT=stdio to use stdio instead (for desktop MCP clients).
     """
-    logger.info("Starting Cisco Secure Firewall FMC MCP server")
-    logger.info("FMC_BASE_URL=%s", FMC_BASE_URL)
-    logger.info("FMC_VERIFY_SSL=%s", FMC_VERIFY_SSL)
-    logger.info("FMC_TIMEOUT=%s", FMC_TIMEOUT)
-    logger.info("FMC_DOMAIN_UUID=%s", FMC_DOMAIN_UUID)
+    Entry point for running as an MCP server.
 
-    transport = os.getenv("MCP_TRANSPORT", "http").lower()
+    Transport is controlled by MCP_TRANSPORT:
+      - "stdio" (default): for desktop MCP clients
+      - "http"          : for Docker / remote agents (Streamable HTTP)
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
 
     if transport == "http":
-        host = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
-        port_str = os.getenv("MCP_HTTP_PORT", "8000")
+        host = os.getenv("MCP_HOST", "0.0.0.0")
+        port_str = os.getenv("MCP_PORT", "8000")
         try:
             port = int(port_str)
         except ValueError:
-            logger.warning("Invalid MCP_HTTP_PORT=%s, falling back to 8000", port_str)
+            logger.warning("Invalid MCP_PORT=%s, falling back to 8000", port_str)
             port = 8000
-        path = os.getenv("MCP_HTTP_PATH", "/mcp")
-        logger.info("Starting FastMCP HTTP server on %s:%s%s", host, port, path)
-        mcp.run(transport="http", host=host, port=port, path=path)
+
+        logger.info(
+            "Starting MCP server (transport=http) on %s:%s",
+            host,
+            port,
+        )
+        mcp.run(transport="http", host=host, port=port)
     else:
-        logger.info("Starting FastMCP stdio server (MCP_TRANSPORT=%s)", transport)
+        logger.info("Starting MCP server (transport=stdio)")
         mcp.run(transport="stdio")
 
 
