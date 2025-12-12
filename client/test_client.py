@@ -1,46 +1,50 @@
 import asyncio
 import json
 import pprint
+from typing import Any, Optional
 
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-# --- CONFIG ---
 SERVER_URL = "http://localhost:8000/mcp"
 
-# Your lab specifics
-# ACCESS_POLICY_ID = "0050568B-93BD-0ed3-0000-004295033038"
-ACCESS_POLICY_ID = ""
+ACCESS_POLICY_ID = ""  # set default for option 1 if you want
 DEFAULT_TARGET = "FTD-DC"
 
 pp = pprint.PrettyPrinter(indent=2, width=100)
 
 
-def unwrap_tool_result(resp):
-    """
-    Safely unwrap the content from a FastMCP tool call result.
+def _to_int(value: str, default: int) -> int:
+    s = (value or "").strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return default
 
-    FastMCP's HTTP client returns a ToolResponse with .content list.
-    Each item is usually a TextContent(BaseModel) with:
 
-        - .type (e.g. "text")
-        - .text (string payload from server)
+def _to_optional_bool(value: str) -> Optional[bool]:
+    s = (value or "").strip().lower()
+    if not s:
+        return None
+    if s in {"y", "yes", "true", "1"}:
+        return True
+    if s in {"n", "no", "false", "0"}:
+        return False
+    return None
 
-    Our MCP server returns JSON as a string for some tools, so here we:
-      1. Grab first content item
-      2. Read .text
-      3. json.loads(...) if possible, otherwise return raw text
 
-    For tools that already return a dict (e.g. search_access_rules),
-    FastMCP will send JSON directly and .text may be None. In that case
-    we fall back to .json or .model_dump().
-    """
-    if not hasattr(resp, "content") or not resp.content:
+def unwrap_tool_result(resp: Any) -> Any:
+    if resp is None:
+        return None
+
+    content_list = getattr(resp, "content", None)
+    if not content_list:
         return resp
 
-    content = resp.content[0]
+    content = content_list[0]
 
-    # Prefer .text for TextContent
     text = getattr(content, "text", None)
     if text is not None:
         try:
@@ -48,126 +52,94 @@ def unwrap_tool_result(resp):
         except json.JSONDecodeError:
             return text
 
-    # Fallback: if server ever uses JSON content type directly
     json_payload = getattr(content, "json", None)
-    if isinstance(json_payload, (dict, list)):
+    if json_payload is not None:
         return json_payload
 
-    # As a last resort, return the pydantic model as dict
-    try:
-        return content.model_dump()
-    except Exception:
-        return content
+    return resp
 
 
 async def main() -> None:
-    transport = StreamableHttpTransport(url=SERVER_URL)
-    client = Client(transport)
+    print(f"Connecting to MCP server at: {SERVER_URL}\n")
 
-    print(f"\nConnecting to MCP server at: {SERVER_URL}")
-    async with client:
-        # 1) Ping
-        print("\nTesting server connectivity...")
-        await client.ping()
+    transport = StreamableHttpTransport(SERVER_URL)
+    async with Client(transport=transport) as client:
+        print("Testing server connectivity...")
+        tools = await client.list_tools()
         print("✅ Server is reachable!\n")
 
-        # 2) List tools
         print("Available tools:")
-        tools = await client.list_tools()
         pp.pprint(tools)
 
-        # --- Simple menu for testing ---
         print("\nChoose what to test:")
         print("  1) find_rules_by_ip_or_fqdn (policy ID + query)")
         print("  2) find_rules_for_target (target device + query)")
         print("  3) search_access_rules (FMC-driven, across policies)")
-        choice = input("\nEnter 1, 2, or 3 (default 3): ").strip() or "3"
+
+        choice = input("Enter 1, 2, or 3 (default 3): ").strip() or "3"
 
         if choice == "1":
-            if not ACCESS_POLICY_ID:
-                print(
-                    "\n[!] ACCESS_POLICY_ID is empty. "
-                    "Set it in test_client.py before using option 1.\n"
-                )
+            query = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
+            policy_id = input(f"Enter access policy ID [default {ACCESS_POLICY_ID or '<empty>'}]: ").strip() or ACCESS_POLICY_ID
+            if not policy_id:
+                print("❌ access_policy_id is required. Set ACCESS_POLICY_ID in the script or enter it here.")
                 return
 
-            query = input(
-                "Enter query (IP/CIDR/FQDN) [default 192.168.20.25]: "
-            ).strip() or "192.168.20.25"
-
-            print("\nCalling tool: find_rules_by_ip_or_fqdn")
+            print("\nCalling tool: find_rules_by_ip_or_fqdn\n")
             raw_resp = await client.call_tool(
                 "find_rules_by_ip_or_fqdn",
-                {
-                    "query": query,
-                    "access_policy_id": ACCESS_POLICY_ID,
-                },
+                {"query": query, "access_policy_id": policy_id},
             )
 
         elif choice == "2":
-            query = input(
-                "Enter query (IP/CIDR/FQDN) [default 192.168.20.25]: "
-            ).strip() or "192.168.20.25"
-            target = input(
-                f"Enter target device name (FMC device/HA/cluster name) "
-                f"[default {DEFAULT_TARGET}]: "
-            ).strip() or DEFAULT_TARGET
+            query = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
+            target = input(f"Enter target device (name/hostName) [default {DEFAULT_TARGET}]: ").strip() or DEFAULT_TARGET
 
-            print("\nCalling tool: find_rules_for_target")
+            print("\nCalling tool: find_rules_for_target\n")
             raw_resp = await client.call_tool(
                 "find_rules_for_target",
-                {
-                    "query": query,
-                    "target": target,
-                },
+                {"query": query, "target": target},
             )
 
         else:
-            # FMC-driven search_access_rules
-            indicator = input(
-                "Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: "
-            ).strip() or "192.168.20.25"
+            indicator = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
+            indicator_type = input("Indicator type [auto/ip/subnet/fqdn, default auto]: ").strip() or "auto"
 
-            indicator_type = input(
-                "Indicator type [auto/ip/subnet/fqdn, default auto]: "
-            ).strip().lower() or "auto"
-            if indicator_type not in ("auto", "ip", "subnet", "fqdn"):
-                print("[!] Invalid indicator_type, using 'auto'")
-                indicator_type = "auto"
+            rule_set = input("Rule set [access/prefilter/both, default access]: ").strip() or "access"
+            scope = input("Scope [fmc/policy, default fmc]: ").strip() or "fmc"
 
-            scope = input(
-                "Scope [fmc/policy, default fmc]: "
-            ).strip().lower() or "fmc"
-            if scope not in ("fmc", "policy"):
-                print("[!] Invalid scope, using 'fmc'")
-                scope = "fmc"
+            policy_id = input("Policy ID filter (exact) [default blank]: ").strip() or None
+            if scope == "policy" and not policy_id:
+                policy_name = input("Policy name (exact match) [required for scope=policy unless policy_id is set]: ").strip() or None
+            else:
+                policy_name = input("Policy name (exact match) [default blank]: ").strip() or None
 
-            policy_name = None
-            if scope == "policy":
-                policy_name = input(
-                    "Enter Access Policy name (exact match): "
-                ).strip()
-                if not policy_name:
-                    print("[!] Empty policy_name with scope='policy' - aborting.")
-                    return
+            policy_name_contains = input("Policy name contains [default blank]: ").strip() or None
+            max_policies = _to_int(input("Max policies to scan (0 = all) [default 0]: ").strip(), default=0)
 
-            max_results_str = input(
-                "Max results to return [default 100]: "
-            ).strip() or "100"
-            try:
-                max_results = int(max_results_str)
-            except ValueError:
-                print("[!] Invalid max_results, using 100")
-                max_results = 100
+            rule_section = input("Rule section filter (e.g. Mandatory) [default blank]: ").strip() or None
+            rule_action = input("Rule action filter (e.g. ALLOW/BLOCK/FASTPATH) [default blank]: ").strip() or None
+            enabled_only = _to_optional_bool(input("Enabled only? [y/n, blank = ignore]: ").strip())
+            rule_name_contains = input("Rule name contains [default blank]: ").strip() or None
 
-            print("\nCalling tool: search_access_rules")
+            max_results = _to_int(input("Max results to return [default 100]: ").strip(), default=100)
+
+            print("\nCalling tool: search_access_rules\n")
             raw_resp = await client.call_tool(
                 "search_access_rules",
                 {
                     "indicator": indicator,
                     "indicator_type": indicator_type,
+                    "rule_set": rule_set,
                     "scope": scope,
                     "policy_name": policy_name,
+                    "policy_id": policy_id,
+                    "policy_name_contains": policy_name_contains,
+                    "max_policies": max_policies,
+                    "rule_section": rule_section,
+                    "rule_action": rule_action,
+                    "enabled_only": enabled_only,
+                    "rule_name_contains": rule_name_contains,
                     "max_results": max_results,
                 },
             )

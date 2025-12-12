@@ -11,8 +11,8 @@ from .errors import InvalidIndicatorError
 from .fmc.client import FMCClient
 from .logging_conf import configure_logging
 from .tools.find_rules import search_rules_in_policy
-from .tools.target_resolver import resolve_target_to_access_policy
 from .tools.search_access import search_access_rules_impl
+from .tools.target_resolver import resolve_target_to_access_policy
 
 logger = configure_logging("sfw-mcp-fmc")
 
@@ -82,8 +82,16 @@ async def find_rules_for_target(
 async def search_access_rules(
     indicator: str,
     indicator_type: Literal["auto", "ip", "subnet", "fqdn"] = "auto",
+    rule_set: Literal["access", "prefilter", "both"] = "access",
     scope: Literal["policy", "fmc"] = "fmc",
     policy_name: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    policy_name_contains: Optional[str] = None,
+    max_policies: int = 0,
+    rule_section: Optional[str] = None,
+    rule_action: Optional[str] = None,
+    enabled_only: Optional[bool] = None,
+    rule_name_contains: Optional[str] = None,
     max_results: int = 100,
     domain_uuid: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -91,8 +99,16 @@ async def search_access_rules(
         return await search_access_rules_impl(
             indicator=indicator,
             indicator_type=indicator_type,
+            rule_set=rule_set,
             scope=scope,
             policy_name=policy_name,
+            policy_id=policy_id,
+            policy_name_contains=policy_name_contains,
+            max_policies=max_policies,
+            rule_section=rule_section,
+            rule_action=rule_action,
+            enabled_only=enabled_only,
+            rule_name_contains=rule_name_contains,
             max_results=max_results,
             domain_uuid=domain_uuid,
         )

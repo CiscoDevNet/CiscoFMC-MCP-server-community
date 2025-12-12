@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -17,7 +18,7 @@ class FMCClient:
     Minimal async FMC REST API client focused on:
       - Auth/token management
       - Domain resolution
-      - Listing devices/policies/rules
+      - Listing policies / rules
       - Listing network-related objects
     """
 
@@ -159,6 +160,25 @@ class FMCClient:
                 f"FMC {method} {url} returned invalid JSON: {exc}"
             ) from exc
 
+    @staticmethod
+    def _next_offset_from_paging(paging: Dict[str, Any], current_offset: int, limit: int) -> Optional[int]:
+        """
+        FMC paging is not consistent across resources. Some endpoints return paging.next with
+        a URL that includes offset/limit; some return offset fields that do not advance.
+        We parse paging.next when possible, else fall back to offset+limit.
+        """
+        next_link = paging.get("next")
+        if next_link:
+            try:
+                q = parse_qs(urlsplit(str(next_link)).query)
+                if "offset" in q:
+                    return int(q["offset"][0])
+            except Exception:
+                pass
+
+        # Fallback: advance by limit
+        return current_offset + limit
+
     async def _list_paginated(
         self,
         path_suffix: str,
@@ -181,6 +201,8 @@ class FMCClient:
         if expanded:
             base_params.setdefault("expanded", "true")
 
+        last_offset = -1
+
         while True:
             query_params = base_params.copy()
             query_params["offset"] = offset
@@ -194,14 +216,23 @@ class FMCClient:
             all_items.extend(items)
             page_count += 1
 
+            # Stop if no more items
             if not items:
                 break
 
-            next_link = paging.get("next")
-            if not next_link:
+            # Stop if no paging.next and count < limit (common final page)
+            if not paging.get("next") and len(items) < int(base_params.get("limit", limit)):
                 break
 
-            offset = paging.get("offset", offset + limit)
+            # Compute next offset safely
+            next_offset = self._next_offset_from_paging(paging, offset, int(base_params.get("limit", limit)))
+
+            # Guard against non-advancing offsets
+            if next_offset is None or next_offset == offset or next_offset == last_offset:
+                break
+
+            last_offset = offset
+            offset = next_offset
 
             if page_count >= hard_page_limit:
                 logger.warning(
@@ -239,6 +270,24 @@ class FMCClient:
     ) -> List[Dict[str, Any]]:
         return await self._list_paginated(
             f"/policy/accesspolicies/{access_policy_id}/accessrules",
+            limit=limit,
+            hard_page_limit=hard_page_limit,
+            expanded=expanded,
+        )
+
+    # Prefilter policies / rules (NEW)
+    async def list_prefilter_policies(
+        self, *, limit: int = 1000, hard_page_limit: int = 10, expanded: bool = True
+    ) -> List[Dict[str, Any]]:
+        return await self._list_paginated(
+            "/policy/prefilterpolicies", limit=limit, hard_page_limit=hard_page_limit, expanded=expanded
+        )
+
+    async def list_prefilter_rules(
+        self, prefilter_policy_id: str, *, limit: int = 1000, hard_page_limit: int = 10, expanded: bool = True
+    ) -> List[Dict[str, Any]]:
+        return await self._list_paginated(
+            f"/policy/prefilterpolicies/{prefilter_policy_id}/prefilterrules",
             limit=limit,
             hard_page_limit=hard_page_limit,
             expanded=expanded,
