@@ -8,7 +8,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 SERVER_URL = "http://localhost:8000/mcp"
 
-ACCESS_POLICY_ID = ""  # set default for option 1 if you want
+ACCESS_POLICY_ID = ""  # optional default for option 1
 DEFAULT_TARGET = "FTD-DC"
 
 pp = pprint.PrettyPrinter(indent=2, width=100)
@@ -38,24 +38,19 @@ def _to_optional_bool(value: str) -> Optional[bool]:
 def unwrap_tool_result(resp: Any) -> Any:
     if resp is None:
         return None
-
     content_list = getattr(resp, "content", None)
     if not content_list:
         return resp
-
     content = content_list[0]
-
     text = getattr(content, "text", None)
     if text is not None:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             return text
-
     json_payload = getattr(content, "json", None)
     if json_payload is not None:
         return json_payload
-
     return resp
 
 
@@ -82,29 +77,26 @@ async def main() -> None:
             query = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
             policy_id = input(f"Enter access policy ID [default {ACCESS_POLICY_ID or '<empty>'}]: ").strip() or ACCESS_POLICY_ID
             if not policy_id:
-                print("❌ access_policy_id is required. Set ACCESS_POLICY_ID in the script or enter it here.")
+                print("❌ access_policy_id is required.")
                 return
 
             print("\nCalling tool: find_rules_by_ip_or_fqdn\n")
-            raw_resp = await client.call_tool(
-                "find_rules_by_ip_or_fqdn",
-                {"query": query, "access_policy_id": policy_id},
-            )
+            raw_resp = await client.call_tool("find_rules_by_ip_or_fqdn", {"query": query, "access_policy_id": policy_id})
 
         elif choice == "2":
             query = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
             target = input(f"Enter target device (name/hostName) [default {DEFAULT_TARGET}]: ").strip() or DEFAULT_TARGET
+            rule_set = input("Rule set [access/prefilter/both, default access]: ").strip() or "access"
 
             print("\nCalling tool: find_rules_for_target\n")
             raw_resp = await client.call_tool(
                 "find_rules_for_target",
-                {"query": query, "target": target},
+                {"query": query, "target": target, "rule_set": rule_set},
             )
 
         else:
             indicator = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
             indicator_type = input("Indicator type [auto/ip/subnet/fqdn, default auto]: ").strip() or "auto"
-
             rule_set = input("Rule set [access/prefilter/both, default access]: ").strip() or "access"
             scope = input("Scope [fmc/policy, default fmc]: ").strip() or "fmc"
 
@@ -121,7 +113,6 @@ async def main() -> None:
             rule_action = input("Rule action filter (e.g. ALLOW/BLOCK/FASTPATH) [default blank]: ").strip() or None
             enabled_only = _to_optional_bool(input("Enabled only? [y/n, blank = ignore]: ").strip())
             rule_name_contains = input("Rule name contains [default blank]: ").strip() or None
-
             max_results = _to_int(input("Max results to return [default 100]: ").strip(), default=100)
 
             print("\nCalling tool: search_access_rules\n")
