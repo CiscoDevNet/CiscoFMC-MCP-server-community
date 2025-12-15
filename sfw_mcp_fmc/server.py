@@ -18,7 +18,19 @@ from .tools.target_resolver import resolve_target_policies
 
 logger = configure_logging("sfw-mcp-fmc")
 
-mcp = FastMCP("cisco-secure-firewall-fmc")
+SERVER_INSTRUCTIONS = (
+    "Use list_fmc_profiles first to discover available FMC instances (env mode exposes a single "
+    "default profile). Pass the chosen profile id/alias as fmc_profile or omit it to let the server "
+    "use its default. All tools are read-only:\n"
+    "• find_rules_by_ip_or_fqdn searches one access policy by id.\n"
+    "• find_rules_for_target resolves an FTD/HA/cluster target to its assigned access/prefilter "
+    "policies before searching them.\n"
+    "• search_access_rules performs FMC-wide or policy-scoped searches across access/prefilter policies "
+    "and supports network + identity indicators with optional rule filters.\n"
+    "Credentials come from env vars or profile files; only the FMC REST API is called."
+)
+
+mcp = FastMCP("cisco-secure-firewall-fmc", instructions=SERVER_INSTRUCTIONS)
 registry: Optional[FMCProfileRegistry] = None
 _client_cache: Dict[str, FMCClient] = {}
 
@@ -50,6 +62,7 @@ def create_client(profile_key: Optional[str], *, domain_uuid_override: Optional[
 
 @mcp.tool()
 async def list_fmc_profiles() -> Dict[str, Any]:
+    """Describe available FMC profiles from env mode (single) or profile registry (multi)."""
     if not registry:
         settings = FMCSettings.from_env()
         return {
@@ -88,6 +101,7 @@ async def find_rules_by_ip_or_fqdn(
     domain_uuid: Optional[str] = None,
     fmc_profile: Optional[str] = None,
 ) -> str:
+    """Search a specific access policy for rules referencing an IP/CIDR/FQDN indicator."""
     try:
         client = create_client(fmc_profile, domain_uuid_override=domain_uuid)
         result = await search_rules_in_policy(
@@ -111,6 +125,7 @@ async def find_rules_for_target(
     domain_uuid: Optional[str] = None,
     fmc_profile: Optional[str] = None,
 ) -> str:
+    """Resolve an FTD/HA/cluster target to its policies and search them for the indicator."""
     try:
         client = create_client(fmc_profile, domain_uuid_override=domain_uuid)
         await client.ensure_domain_uuid()
@@ -190,6 +205,7 @@ async def search_access_rules(
     domain_uuid: Optional[str] = None,
     fmc_profile: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Run FMC-wide or policy-scoped rule searches with network/identity indicators and filters."""
     try:
         client = create_client(fmc_profile, domain_uuid_override=domain_uuid)
         return await search_access_rules_impl(
