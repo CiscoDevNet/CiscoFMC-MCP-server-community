@@ -13,6 +13,8 @@ FQDN_PATTERN = re.compile(
     r"\.[A-Za-z]{2,}$"
 )
 
+IDENTITY_INDICATOR_TYPES = {"sgt", "realm_user", "realm_group"}
+
 
 class QueryKind:
     IP = "ip"
@@ -45,6 +47,12 @@ def parse_literal_value(value: str) -> Tuple[str, Any]:
 
 
 def classify_indicator(indicator: str, indicator_type: str = "auto") -> Tuple[str, Any]:
+    if indicator_type in IDENTITY_INDICATOR_TYPES:
+        normalized = indicator.strip()
+        if not normalized:
+            raise InvalidIndicatorError(f"Indicator cannot be empty when indicator_type='{indicator_type}'.")
+        return QueryKind.FQDN, normalized.lower()
+
     kind, value = parse_query(indicator)
     value_str = str(value)
 
@@ -70,7 +78,7 @@ def classify_indicator(indicator: str, indicator_type: str = "auto") -> Tuple[st
 
     raise InvalidIndicatorError(
         f"Expected {indicator_type} but got '{kind}' for '{indicator}'. "
-        "Use 'auto', 'ip', 'subnet', or 'fqdn'."
+        "Use 'auto', 'ip', 'subnet', 'fqdn', 'sgt', 'realm_user', or 'realm_group'."
     )
 
 

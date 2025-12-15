@@ -47,6 +47,7 @@ async def find_rules_by_ip_or_fqdn(
 async def find_rules_for_target(
     query: str,
     target: str,
+    indicator_type: Literal["auto", "ip", "subnet", "fqdn", "sgt", "realm_user", "realm_group"] = "auto",
     rule_set: Literal["access", "prefilter", "both"] = "access",
     domain_uuid: Optional[str] = None,
 ) -> str:
@@ -76,7 +77,7 @@ async def find_rules_for_target(
             if ap.get("id"):
                 out["access_result"] = await search_access_rules_impl(
                     indicator=query,
-                    indicator_type="auto",
+                    indicator_type=indicator_type,
                     rule_set="access",
                     scope="policy",
                     policy_id=ap["id"],
@@ -92,7 +93,7 @@ async def find_rules_for_target(
             if pp.get("id"):
                 out["prefilter_result"] = await search_access_rules_impl(
                     indicator=query,
-                    indicator_type="auto",
+                    indicator_type=indicator_type,
                     rule_set="prefilter",
                     scope="policy",
                     policy_id=pp["id"],
@@ -117,7 +118,7 @@ async def find_rules_for_target(
 @mcp.tool()
 async def search_access_rules(
     indicator: str,
-    indicator_type: Literal["auto", "ip", "subnet", "fqdn"] = "auto",
+    indicator_type: Literal["auto", "ip", "subnet", "fqdn", "sgt", "realm_user", "realm_group"] = "auto",
     rule_set: Literal["access", "prefilter", "both"] = "access",
     scope: Literal["policy", "fmc"] = "fmc",
     policy_name: Optional[str] = None,

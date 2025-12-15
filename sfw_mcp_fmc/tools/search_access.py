@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from ..config import FMCSettings
 from ..errors import InvalidIndicatorError
@@ -11,15 +11,49 @@ from .find_rules import build_object_index, serialize_network_object
 
 logger = configure_logging("sfw-mcp-fmc")
 
+NETWORK_INDICATOR_TYPES = {"auto", "ip", "subnet", "fqdn"}
+IDENTITY_INDICATOR_TYPES = {"sgt", "realm_user", "realm_group"}
+VALID_INDICATOR_TYPES = NETWORK_INDICATOR_TYPES | IDENTITY_INDICATOR_TYPES
+
 
 def _norm(s: Optional[str]) -> str:
     return (s or "").strip().lower()
 
 
+def _match_identity_objects(
+    block: Optional[Dict[str, Any]],
+    indicator_norm: str,
+    *,
+    allowed_types: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    if not block or not indicator_norm:
+        return []
+
+    matches: List[Dict[str, Any]] = []
+    for ref in block.get("objects") or []:
+        if not isinstance(ref, dict):
+            continue
+        ref_type = _norm(ref.get("type"))
+        if allowed_types and ref_type not in allowed_types:
+            continue
+
+        if indicator_norm in {_norm(ref.get("name")), _norm(ref.get("id"))}:
+            matches.append(
+                {
+                    "id": ref.get("id"),
+                    "name": ref.get("name"),
+                    "type": ref.get("type"),
+                    "realm": ref.get("realm"),
+                }
+            )
+
+    return matches
+
+
 async def search_access_rules_impl(
     *,
     indicator: str,
-    indicator_type: Literal["auto", "ip", "subnet", "fqdn"] = "auto",
+    indicator_type: Literal["auto", "ip", "subnet", "fqdn", "sgt", "realm_user", "realm_group"] = "auto",
     rule_set: Literal["access", "prefilter", "both"] = "access",
     scope: Literal["policy", "fmc"] = "fmc",
     policy_name: Optional[str] = None,
@@ -64,21 +98,47 @@ async def search_access_rules_impl(
 
     client = FMCClient(settings)
 
-    try:
-        kind, value = classify_indicator(indicator, indicator_type)
-    except InvalidIndicatorError as e:
+    if indicator_type not in VALID_INDICATOR_TYPES:
         return {
             "error": {
-                "category": "INVALID_INDICATOR",
-                "indicator": indicator,
-                "indicator_type": indicator_type,
-                "message": str(e),
+                "category": "VALIDATION",
+                "message": f"Unsupported indicator_type '{indicator_type}'.",
             }
         }
 
-    effective_indicator_type = (
-        "ip" if kind == QueryKind.IP else "subnet" if kind == QueryKind.NETWORK else "fqdn"
-    )
+    network_indicator = indicator_type in NETWORK_INDICATOR_TYPES
+    identity_indicator_norm: Optional[str] = None
+
+    if network_indicator:
+        try:
+            kind, value = classify_indicator(indicator, indicator_type)
+        except InvalidIndicatorError as e:
+            return {
+                "error": {
+                    "category": "INVALID_INDICATOR",
+                    "indicator": indicator,
+                    "indicator_type": indicator_type,
+                    "message": str(e),
+                }
+            }
+
+        effective_indicator_type = (
+            "ip" if kind == QueryKind.IP else "subnet" if kind == QueryKind.NETWORK else "fqdn"
+        )
+    else:
+        kind = None
+        value = None
+        identity_indicator_norm = _norm(indicator)
+        if not identity_indicator_norm:
+            return {
+                "error": {
+                    "category": "INVALID_INDICATOR",
+                    "indicator": indicator,
+                    "indicator_type": indicator_type,
+                    "message": "Indicator cannot be empty for this indicator_type.",
+                }
+            }
+        effective_indicator_type = indicator_type
 
     # ---- Policy sources based on rule_set ----
     policy_sources: List[Tuple[str, List[Dict[str, Any]]]] = []
@@ -150,10 +210,13 @@ async def search_access_rules_impl(
     if max_policies > 0:
         filtered_policies = filtered_policies[:max_policies]
 
-    # Build object index once (shared for access + prefilter rules)
-    obj_index = await build_object_index(client)
-    matching_objects = obj_index.match_objects(kind, value)
-    matched_object_ids: Dict[str, Dict[str, Any]] = {o.id: serialize_network_object(o) for o in matching_objects}
+    # Build object index once (shared for access + prefilter rules) when indicator is network-based
+    matching_objects: List[Any] = []
+    matched_object_ids: Dict[str, Dict[str, Any]] = {}
+    if network_indicator and kind is not None and value is not None:
+        obj_index = await build_object_index(client)
+        matching_objects = obj_index.match_objects(kind, value)
+        matched_object_ids = {o.id: serialize_network_object(o) for o in matching_objects}
 
     # ---- Rule filtering helpers ----
     section_norm = _norm(rule_section)
@@ -213,35 +276,73 @@ async def search_access_rules_impl(
             src_block = (rule.get("sourceNetworks") or {}).copy()
             dst_block = (rule.get("destinationNetworks") or {}).copy()
 
-            src_lit_matches = collect_matching_literals(kind, value, src_block)
-            dst_lit_matches = collect_matching_literals(kind, value, dst_block)
-
+            src_lit_matches: List[Dict[str, Any]] = []
+            dst_lit_matches: List[Dict[str, Any]] = []
             src_object_matches: List[Dict[str, Any]] = []
             dst_object_matches: List[Dict[str, Any]] = []
 
-            for ref in src_block.get("objects") or []:
-                obj_id = ref.get("id")
-                if obj_id and obj_id in matched_object_ids:
-                    src_object_matches.append(
-                        {
-                            "id": obj_id,
-                            "name": ref.get("name") or matched_object_ids[obj_id]["name"],
-                            "type": ref.get("type") or matched_object_ids[obj_id]["type"],
-                        }
-                    )
+            if network_indicator and kind is not None and value is not None:
+                src_lit_matches = collect_matching_literals(kind, value, src_block)
+                dst_lit_matches = collect_matching_literals(kind, value, dst_block)
 
-            for ref in dst_block.get("objects") or []:
-                obj_id = ref.get("id")
-                if obj_id and obj_id in matched_object_ids:
-                    dst_object_matches.append(
-                        {
-                            "id": obj_id,
-                            "name": ref.get("name") or matched_object_ids[obj_id]["name"],
-                            "type": ref.get("type") or matched_object_ids[obj_id]["type"],
-                        }
-                    )
+                for ref in src_block.get("objects") or []:
+                    obj_id = ref.get("id")
+                    if obj_id and obj_id in matched_object_ids:
+                        src_object_matches.append(
+                            {
+                                "id": obj_id,
+                                "name": ref.get("name") or matched_object_ids[obj_id]["name"],
+                                "type": ref.get("type") or matched_object_ids[obj_id]["type"],
+                            }
+                        )
 
-            if not (src_lit_matches or dst_lit_matches or src_object_matches or dst_object_matches):
+                for ref in dst_block.get("objects") or []:
+                    obj_id = ref.get("id")
+                    if obj_id and obj_id in matched_object_ids:
+                        dst_object_matches.append(
+                            {
+                                "id": obj_id,
+                                "name": ref.get("name") or matched_object_ids[obj_id]["name"],
+                                "type": ref.get("type") or matched_object_ids[obj_id]["type"],
+                            }
+                        )
+
+            source_sgt_matches: List[Dict[str, Any]] = []
+            destination_sgt_matches: List[Dict[str, Any]] = []
+            user_matches: List[Dict[str, Any]] = []
+
+            if indicator_type == "sgt" and identity_indicator_norm:
+                allowed = {"isesecuritygrouptag"}
+                source_sgt_matches = _match_identity_objects(
+                    rule.get("sourceSecurityGroupTags"), identity_indicator_norm, allowed_types=allowed
+                )
+                destination_sgt_matches = _match_identity_objects(
+                    rule.get("destinationSecurityGroupTags"), identity_indicator_norm, allowed_types=allowed
+                )
+            elif indicator_type == "realm_user" and identity_indicator_norm:
+                allowed = {"realmuser"}
+                user_matches = _match_identity_objects(
+                    rule.get("users"),
+                    identity_indicator_norm,
+                    allowed_types=allowed,
+                )
+            elif indicator_type == "realm_group" and identity_indicator_norm:
+                allowed = {"realmusergroup"}
+                user_matches = _match_identity_objects(
+                    rule.get("users"),
+                    identity_indicator_norm,
+                    allowed_types=allowed,
+                )
+
+            if not (
+                src_lit_matches
+                or dst_lit_matches
+                or src_object_matches
+                or dst_object_matches
+                or source_sgt_matches
+                or destination_sgt_matches
+                or user_matches
+            ):
                 continue
 
             rule_entry = {
@@ -259,6 +360,9 @@ async def search_access_rules_impl(
                 "destination_literal_matches": dst_lit_matches,
                 "source_object_matches": src_object_matches,
                 "destination_object_matches": dst_object_matches,
+                "source_security_group_tag_matches": source_sgt_matches,
+                "destination_security_group_tag_matches": destination_sgt_matches,
+                "user_matches": user_matches,
             }
 
             matched_items.append(

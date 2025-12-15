@@ -84,19 +84,24 @@ async def main() -> None:
             raw_resp = await client.call_tool("find_rules_by_ip_or_fqdn", {"query": query, "access_policy_id": policy_id})
 
         elif choice == "2":
-            query = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
+            query = input("Enter indicator (IP/CIDR/FQDN/SGT/Realm user or group) [default 192.168.20.25]: ").strip() or "192.168.20.25"
+            indicator_type = (
+                input("Indicator type [auto/ip/subnet/fqdn/sgt/realm_user/realm_group, default auto]: ").strip() or "auto"
+            )
             target = input(f"Enter target device (name/hostName) [default {DEFAULT_TARGET}]: ").strip() or DEFAULT_TARGET
             rule_set = input("Rule set [access/prefilter/both, default access]: ").strip() or "access"
 
             print("\nCalling tool: find_rules_for_target\n")
             raw_resp = await client.call_tool(
                 "find_rules_for_target",
-                {"query": query, "target": target, "rule_set": rule_set},
+                {"query": query, "indicator_type": indicator_type, "target": target, "rule_set": rule_set},
             )
 
         else:
-            indicator = input("Enter indicator (IP/CIDR/FQDN) [default 192.168.20.25]: ").strip() or "192.168.20.25"
-            indicator_type = input("Indicator type [auto/ip/subnet/fqdn, default auto]: ").strip() or "auto"
+            indicator = input("Enter indicator (IP/CIDR/FQDN/SGT/Realm user or group) [default 192.168.20.25]: ").strip() or "192.168.20.25"
+            indicator_type = (
+                input("Indicator type [auto/ip/subnet/fqdn/sgt/realm_user/realm_group, default auto]: ").strip() or "auto"
+            )
             rule_set = input("Rule set [access/prefilter/both, default access]: ").strip() or "access"
             scope = input("Scope [fmc/policy, default fmc]: ").strip() or "fmc"
 
