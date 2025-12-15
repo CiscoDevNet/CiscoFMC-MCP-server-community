@@ -100,6 +100,36 @@ class FMCClient:
         self._domain_uuid = domain_uuid
         return domain_uuid
 
+    @staticmethod
+    def _expanded_param_enabled(params: Optional[Dict[str, Any]]) -> bool:
+        if not params:
+            return False
+        v = params.get("expanded")
+        if v is None:
+            return False
+        return str(v).strip().lower() in {"true", "1", "yes"}
+
+    @staticmethod
+    def _looks_like_expanded_rejected(resp: httpx.Response) -> bool:
+        """
+        Heuristic to avoid masking real 400s: only fallback if response body
+        mentions 'expanded' (common FMC error text for unsupported query param).
+        """
+        try:
+            text = (resp.text or "").lower()
+        except Exception:
+            text = ""
+        if "expanded" in text:
+            return True
+
+        # Some FMC responses are JSON with message/description fields
+        try:
+            j = resp.json()
+            blob = json.dumps(j).lower()
+            return "expanded" in blob
+        except Exception:
+            return False
+
     async def _request_json(
         self,
         method: str,
@@ -135,21 +165,47 @@ class FMCClient:
             "Accept": "application/json",
         }
 
-        async with httpx.AsyncClient(verify=self._settings.verify_ssl, timeout=self._settings.timeout) as client:
-            resp = await client.request(method, url, headers=headers, params=params, json=json_body)
+        method_u = method.upper()
+
+        async with httpx.AsyncClient(
+            verify=self._settings.verify_ssl, timeout=self._settings.timeout
+        ) as client:
+            logger.info("FMC request: %s %s (params=%s)", method_u, url, params)
+            resp = await client.request(
+                method_u, url, headers=headers, params=params, json=json_body
+            )
 
             # refresh token on 401
             if resp.status_code == 401:
                 await self._authenticate()
                 headers["X-auth-access-token"] = self._access_token or ""
-                resp = await client.request(method, url, headers=headers, params=params, json=json_body)
+                logger.info("FMC request (retry after 401): %s %s (params=%s)", method_u, url, params)
+                resp = await client.request(
+                    method_u, url, headers=headers, params=params, json=json_body
+                )
+
+            # ✅ Best-effort fallback for endpoints that reject expanded=true on GET-by-id
+            if (
+                resp.status_code == 400
+                and method_u == "GET"
+                and self._expanded_param_enabled(params)
+                and self._looks_like_expanded_rejected(resp)
+            ):
+                retry_params = dict(params or {})
+                retry_params.pop("expanded", None)
+                logger.info(
+                    "Endpoint rejected expanded=true; retrying without expanded: %s",
+                    url,
+                )
+                resp = await client.request(
+                    method_u, url, headers=headers, params=retry_params, json=json_body
+                )
 
         if ignore_statuses and resp.status_code in ignore_statuses:
             return {}
 
         resp.raise_for_status()
         return resp.json() if resp.text else {}
-
 
     @staticmethod
     def _next_offset_from_paging(paging: Dict[str, Any], current_offset: int, limit: int) -> Optional[int]:
@@ -350,7 +406,16 @@ class FMCClient:
 
     async def get_access_policy(self, policy_id: str, *, expanded: bool = True) -> Dict[str, Any]:
         params = {"expanded": "true"} if expanded else None
-        return await self._request_json("GET", f"/policy/accesspolicies/{policy_id}", params=params)
+        try:
+            return await self._request_json("GET", f"/policy/accesspolicies/{policy_id}", params=params)
+        except httpx.HTTPStatusError as exc:
+            if expanded and exc.response.status_code == 400:
+                logger.info(
+                    "AccessPolicy GET rejected expanded param; retrying w/out expanded: %s",
+                    policy_id,
+                )
+                return await self._request_json("GET", f"/policy/accesspolicies/{policy_id}")
+            raise
 
     async def get_device_record(self, device_id: str, *, expanded: bool = True) -> Dict[str, Any]:
         params = {"expanded": "true"} if expanded else None
