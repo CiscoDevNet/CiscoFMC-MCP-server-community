@@ -392,6 +392,11 @@ async def search_access_rules_impl(
         "scope": scope,
         "policies_considered": len(filtered_policies),
         "policies_scanned": scanned_policies,
+        "policies": [
+            {"id": (p.get("id") or "").strip(), "name": p.get("name"), "type": p.get("_policyType")}
+            for p in filtered_policies
+            if p.get("id")
+        ],
         "matched_rules_count": len(matched_items),
         "matched_object_count": len(matching_objects),
         "truncated": truncated,
