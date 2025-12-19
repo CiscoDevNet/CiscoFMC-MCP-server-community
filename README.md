@@ -11,7 +11,7 @@ MCP server that exposes high-level tooling for Cisco Secure Firewall Management 
 
 ### Single FMC (env mode)
 
-Create `.env` (or export env vars) with at least:
+Copy `.env.example` to `.env` (or export env vars) and fill in at least:
 
 ```
 FMC_BASE_URL=https://<fmc-host>
@@ -22,7 +22,7 @@ FMC_VERIFY_SSL=false
 
 ### Multiple FMCs (profile mode)
 
-Define one env file per FMC under `profiles/`. Example `profiles/fmc-north-south.env`:
+Define one env file per FMC under `profiles/`. Copy `profiles/.env.example` to a new filename (e.g., `profiles/fmc-north-south.env`) and fill it:
 
 ```
 FMC_PROFILE_ID=fmc-north-south
@@ -51,9 +51,11 @@ When `FMC_PROFILES_DIR` is set, the server auto-loads every `*.env` file in that
 docker compose up -d --build
 ```
 
-Docker uses `.env` for both server settings and FMC credentials; rebuild after changing `requirements.txt` or profile files.
+The compose file expects your `.env` in the repo root (or point `env_file` at a specific profile file). Rebuild after changing `requirements.txt` or profile files.
 
 ### Local Python
+
+You can run the server directly without Docker:
 
 ```bash
 python -m venv .venv

@@ -1,6 +1,8 @@
 services:
   mcp-sfw-fmc:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: mcp-sfw-fmc
     env_file:
       - .env

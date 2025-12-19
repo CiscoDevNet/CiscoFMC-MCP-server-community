@@ -1,20 +1,30 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Environments
 .venv/
 venv/
+client/venv/
 .env
-.env.*
+*.env.local
 
-# macOS
+# Profiles (keep example)
+profiles/*.env
+!profiles/.env.example
+
+# Editor/OS
 .DS_Store
-
-# IDE
 .vscode/
 .idea/
 
-# Testing
-.pytest_cache/
-
-# Project-specific
-client/venv/
+# Logs/archives
+*.log
+*.bak
+archive/
