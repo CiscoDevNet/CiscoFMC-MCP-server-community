@@ -1,3 +1,7 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# SPDX-License-Identifier: MIT
+
 class FMCClientError(Exception):
     """Base exception for FMC client errors."""
 
