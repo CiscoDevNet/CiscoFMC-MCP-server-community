@@ -62,6 +62,22 @@ async def test_search_access_matches_network_objects(monkeypatch):
                 "metadata": {"ruleIndex": 1, "section": "Mandatory"},
                 "sourceNetworks": {"objects": [{"id": "obj-host", "name": "HostA", "type": "Host"}]},
                 "destinationNetworks": {},
+                "destinationPorts": {
+                    "objects": [
+                        {
+                            "id": "port-https",
+                            "name": "HTTPS",
+                            "type": "ProtocolPortObject",
+                            "protocol": "TCP",
+                            "port": "443",
+                        }
+                    ]
+                },
+                "sourceZones": {"objects": [{"id": "z1", "name": "Inside", "type": "SecurityZone"}]},
+                "ipsPolicy": {"id": "ips1", "name": "FTD_IPS", "type": "IntrusionPolicy"},
+                "logBegin": True,
+                "logEnd": False,
+                "sendEventsToFMC": True,
             }
         ]
     }
@@ -91,6 +107,16 @@ async def test_search_access_matches_network_objects(monkeypatch):
     assert rule["source_object_matches"][0]["name"] == "HostA"
     assert result["meta"]["policies_scanned"] == 1
     assert result["meta"]["indicator_type"] == "ip"
+
+    # Full rule details are now surfaced alongside the match summary.
+    full = rule["full"]
+    assert full["destination_ports"][0]["name"] == "HTTPS"
+    assert full["destination_ports"][0]["protocol"] == "TCP"
+    assert full["source_zones"][0]["name"] == "Inside"
+    assert full["ips_policy"]["name"] == "FTD_IPS"
+    assert full["logging"]["log_begin"] is True
+    assert full["logging"]["log_end"] is False
+    assert full["logging"]["send_events_to_fmc"] is True
 
 
 @pytest.mark.asyncio

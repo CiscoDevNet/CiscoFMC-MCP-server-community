@@ -308,3 +308,7 @@ def main() -> None:
     else:
         logger.info("Starting MCP server (transport=stdio)")
         mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

@@ -28,3 +28,6 @@ profiles/*.env
 *.log
 *.bak
 archive/
+
+# Output Reports, This use for LLM build the report.
+output/
