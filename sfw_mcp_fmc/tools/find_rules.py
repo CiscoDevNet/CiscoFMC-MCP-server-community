@@ -45,6 +45,167 @@ def serialize_network_object(obj: Any) -> Dict[str, Any]:
     }
 
 
+def _ref_list(block: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten an FMC object block ({"objects": [...]}) into name/id/type refs."""
+    if not isinstance(block, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for ref in block.get("objects") or []:
+        if isinstance(ref, dict):
+            out.append({"id": ref.get("id"), "name": ref.get("name"), "type": ref.get("type")})
+    return out
+
+
+def _literal_list(block: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(block, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for lit in block.get("literals") or []:
+        if isinstance(lit, dict):
+            out.append({"type": lit.get("type"), "value": lit.get("value")})
+    return out
+
+
+def _network_block(block: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    objs = _ref_list(block)
+    lits = _literal_list(block)
+    if not objs and not lits:
+        return {}
+    result: Dict[str, Any] = {}
+    if objs:
+        result["objects"] = objs
+    if lits:
+        result["literals"] = lits
+    return result
+
+
+def _port_block(block: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(block, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for ref in block.get("objects") or []:
+        if isinstance(ref, dict):
+            out.append(
+                {
+                    "id": ref.get("id"),
+                    "name": ref.get("name"),
+                    "type": ref.get("type"),
+                    "protocol": ref.get("protocol"),
+                    "port": ref.get("port"),
+                }
+            )
+    for lit in block.get("literals") or []:
+        if isinstance(lit, dict):
+            out.append(
+                {
+                    "type": lit.get("type"),
+                    "protocol": lit.get("protocol"),
+                    "port": lit.get("port"),
+                }
+            )
+    return out
+
+
+def _applications(block: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(block, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for app in block.get("applications") or []:
+        if isinstance(app, dict):
+            out.append({"id": app.get("id"), "name": app.get("name"), "type": app.get("type")})
+    return out
+
+
+def _urls(block: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(block, dict):
+        return {}
+    result: Dict[str, Any] = {}
+    objs = [
+        {"id": o.get("id"), "name": o.get("name"), "type": o.get("type")}
+        for o in (block.get("objects") or [])
+        if isinstance(o, dict)
+    ]
+    cats = []
+    for c in block.get("urlCategoriesWithReputation") or []:
+        if isinstance(c, dict):
+            category = c.get("category") or {}
+            cats.append(
+                {
+                    "category": category.get("name"),
+                    "id": category.get("id"),
+                    "reputation": c.get("reputation"),
+                }
+            )
+    if objs:
+        result["objects"] = objs
+    if cats:
+        result["categories"] = cats
+    return result
+
+
+def _named_ref(block: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(block, dict) or not block.get("name"):
+        return None
+    ref = {"name": block.get("name"), "id": block.get("id"), "type": block.get("type")}
+    if block.get("inspectionMode"):
+        ref["inspectionMode"] = block.get("inspectionMode")
+    return ref
+
+
+def _comments(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in rule.get("commentHistoryList") or []:
+        if isinstance(c, dict):
+            out.append(
+                {
+                    "user": (c.get("user") or {}).get("name"),
+                    "date": c.get("date"),
+                    "comment": c.get("comment"),
+                }
+            )
+    return out
+
+
+def serialize_full_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a complete, compacted view of an FMC access/prefilter rule.
+
+    Includes the fields the FMC expanded response carries that the match-only
+    summary omits: full source/destination networks, ports, zones, logging,
+    IPS/file policy, applications, URLs, SGT, users, dynamic objects, comments.
+    Empty sections are dropped to keep the payload lean.
+    """
+    full: Dict[str, Any] = {}
+
+    full["source_networks"] = _network_block(rule.get("sourceNetworks"))
+    full["destination_networks"] = _network_block(rule.get("destinationNetworks"))
+    full["source_ports"] = _port_block(rule.get("sourcePorts"))
+    full["destination_ports"] = _port_block(rule.get("destinationPorts"))
+    full["source_zones"] = _ref_list(rule.get("sourceZones"))
+    full["destination_zones"] = _ref_list(rule.get("destinationZones"))
+    full["source_security_group_tags"] = _ref_list(rule.get("sourceSecurityGroupTags"))
+    full["destination_security_group_tags"] = _ref_list(rule.get("destinationSecurityGroupTags"))
+    full["source_dynamic_objects"] = _ref_list(rule.get("sourceDynamicObjects"))
+    full["destination_dynamic_objects"] = _ref_list(rule.get("destinationDynamicObjects"))
+    full["users"] = _ref_list(rule.get("users"))
+    full["applications"] = _applications(rule.get("applications"))
+    full["urls"] = _urls(rule.get("urls"))
+    full["vlan_tags"] = _ref_list(rule.get("vlanTags"))
+    full["ips_policy"] = _named_ref(rule.get("ipsPolicy"))
+    full["file_policy"] = _named_ref(rule.get("filePolicy"))
+    full["variable_set"] = _named_ref(rule.get("variableSet"))
+    full["logging"] = {
+        "log_begin": bool(rule.get("logBegin", False)),
+        "log_end": bool(rule.get("logEnd", False)),
+        "log_files": bool(rule.get("logFiles", False)),
+        "send_events_to_fmc": bool(rule.get("sendEventsToFMC", False)),
+        "enable_syslog": bool(rule.get("enableSyslog", False)),
+    }
+    full["comments"] = _comments(rule)
+
+    # Drop empty containers to keep payload compact
+    return {k: v for k, v in full.items() if v}
+
+
 def _extract_value(item: Dict[str, Any]) -> Any:
     # FMC object fields vary by type
     return (
@@ -425,6 +586,7 @@ async def search_rules_in_policy(
                     "destination_literal_matches": dst_lit,
                     "source_object_matches": src_obj,
                     "destination_object_matches": dst_obj,
+                    "full": serialize_full_rule(rule),
                 }
             }
         )

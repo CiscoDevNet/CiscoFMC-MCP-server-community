@@ -60,26 +60,70 @@ Notes:
 
 ## 2. Run the MCP server
 
+### Transport selection
+
+The transport is chosen with the `MCP_TRANSPORT` environment variable:
+
+| `MCP_TRANSPORT` | Behavior | Typical use |
+| --------------- | -------- | ----------- |
+| `stdio` (default) | Server speaks MCP over stdin/stdout. No network port is opened. | Desktop MCP clients that spawn the server as a subprocess (Claude Desktop, VS Code, Cursor, etc.). |
+| `http` | Server listens on `MCP_HOST`:`MCP_PORT` and serves `/mcp`. | Shared/remote deployments, Docker, multiple concurrent agents. |
+
+If `MCP_TRANSPORT` is unset, the server starts in **stdio** mode.
+
 ### Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-The compose file expects your `.env` in the repo root (or point `env_file` at a specific profile file). Rebuild after changing `requirements.txt` or profile files.
+Docker deployments use the HTTP transport (set `MCP_TRANSPORT=http`, `MCP_HOST`, and `MCP_PORT` in `.env` or `docker-compose.yml`). The compose file expects your `.env` in the repo root (or point `env_file` at a specific profile file). Rebuild after changing `requirements.txt` or profile files.
 
-### Local Python
+### Local Python (stdio)
 
-You can run the server directly without Docker:
+stdio is the default transport and the simplest way to run the server locally — an MCP-aware client launches it as a subprocess and communicates over stdin/stdout, so no port is exposed.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m sfw_mcp_fmc.server
+MCP_TRANSPORT=stdio python -m sfw_mcp_fmc.server
 ```
 
-Configure transport via `.env` (default is HTTP on `http://0.0.0.0:8000/mcp` for local/dev). When exposing it publicly, front it with HTTPS such as `https://<host>:8000/mcp`. Logs show which FMC profiles loaded.
+Running the command above by hand will appear to “hang” — that is expected, because the process is waiting for an MCP client to talk to it over stdin/stdout. Normally you let your MCP client start it for you using a config like this:
+
+```jsonc
+{
+  "mcpServers": {
+    "cisco-fmc": {
+      "command": "python",
+      "args": ["-m", "sfw_mcp_fmc.server"],
+      "cwd": "/absolute/path/to/CiscoFMC-MCP-server-community",
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "FMC_PROFILES_DIR": "profiles",
+        "FMC_PROFILE_DEFAULT": "fmc-north-south"
+      }
+    }
+  }
+}
+```
+
+Notes for stdio mode:
+- Point `command` at the interpreter from your virtualenv (e.g. `.venv/bin/python`) so dependencies resolve, or ensure `python` is the right one on `PATH`.
+- Set `cwd` to the repo root so relative paths like `FMC_PROFILES_DIR=profiles` resolve.
+- For single-FMC mode, drop the profile vars and provide `FMC_BASE_URL` / `FMC_USERNAME` / `FMC_PASSWORD` instead (in `env` or a root `.env`).
+- In stdio mode the server must not print anything to stdout except MCP traffic; logging goes to stderr, so keep custom logging on stderr.
+
+### Local Python (HTTP)
+
+To expose the server over the network instead, opt into the HTTP transport:
+
+```bash
+MCP_TRANSPORT=http MCP_HOST=0.0.0.0 MCP_PORT=8000 python -m sfw_mcp_fmc.server
+```
+
+This serves the endpoint at `http://0.0.0.0:8000/mcp` for local/dev. When exposing it publicly, front it with HTTPS such as `https://<host>:8000/mcp`. Logs show which FMC profiles loaded.
 
 #### Note on HTTP bearer auth
 
@@ -111,7 +155,7 @@ python -m pytest tests
 
 Because the server follows the MCP protocol (via FastMCP), any MCP-aware agent platform can consume it:
 
-1. Register the MCP endpoint (stdio or HTTP). For HTTP, point to `https://<host>:8000/mcp` when exposed publicly (use `http://localhost:8000/mcp` for local/dev).
+1. Register the MCP endpoint (stdio or HTTP). For stdio, configure the client to spawn `python -m sfw_mcp_fmc.server` with `MCP_TRANSPORT=stdio` (see the stdio config example above). For HTTP, point to `https://<host>:8000/mcp` when exposed publicly (use `http://localhost:8000/mcp` for local/dev).
 2. From the agent, call `list_fmc_profiles` to pick an FMC (by `id` or alias).
 3. Call the other tools with `fmc_profile` plus your indicator/filters.
 4. Consume the structured JSON responses to drive subsequent steps (summaries, remediation, follow-up searches).

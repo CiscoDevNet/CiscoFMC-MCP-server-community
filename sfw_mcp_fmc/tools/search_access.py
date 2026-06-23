@@ -11,7 +11,7 @@ from ..errors import InvalidIndicatorError
 from ..fmc.client import FMCClient
 from ..logging_conf import configure_logging
 from ..match.indicator import QueryKind, classify_indicator, collect_matching_literals
-from .find_rules import build_object_index, serialize_network_object
+from .find_rules import build_object_index, serialize_full_rule, serialize_network_object
 
 logger = configure_logging("sfw-mcp-fmc")
 
@@ -370,6 +370,7 @@ async def search_access_rules_impl(
                 "source_security_group_tag_matches": source_sgt_matches,
                 "destination_security_group_tag_matches": destination_sgt_matches,
                 "user_matches": user_matches,
+                "full": serialize_full_rule(rule),
             }
 
             matched_items.append(
